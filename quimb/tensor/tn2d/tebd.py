@@ -1038,6 +1038,11 @@ class FullUpdate(TEBD2D):
         * ``'sweep'``: every total sweep
         * int: every ``x`` number of total sweeps
 
+    compute_envs_mode : {'mps', 'src', 'full-bond', ...}, optional
+        Boundary-contraction ``mode`` passed to
+        ``compute_plaquette_environments`` when building the gate-fit
+        environments. Default ``'mps'``. Other modes (e.g. ``'src'``) can be
+        cheaper / lower-memory for the doubled-layer contraction at large bond.
     pre_normalize : bool, optional
         Actively renormalize the state using the computed environments.
     condition_tensors : bool, optional
@@ -1083,6 +1088,7 @@ class FullUpdate(TEBD2D):
         fit_strategy="als",
         fit_opts=None,
         compute_envs_every=1,
+        compute_envs_mode="mps",
         pre_normalize=True,
         condition_tensors=True,
         condition_balance_bonds=True,
@@ -1134,6 +1140,7 @@ class FullUpdate(TEBD2D):
         self.condition_balance_bonds = bool(condition_balance_bonds)
 
         self.compute_envs_every = compute_envs_every
+        self.compute_envs_mode = compute_envs_mode
         self._env_n = self._env_term_count = self._env_group_count = -1
 
         self._psi.add_tag("KET")
@@ -1205,6 +1212,7 @@ class FullUpdate(TEBD2D):
                     y_bsz=y_bsz,
                     max_bond=self.chi,
                     cutoff=0.0,
+                    mode=self.compute_envs_mode,
                     equalize_norms=True,
                 )
             )
