@@ -748,7 +748,13 @@ def gate_full_update_als(
     target = ket_plq.gate(G, where, contract=False) | env
 
     if init_simple_guess:
-        ket_plq.gate_(G, where, contract="reduce-split", max_bond=max_bond)
+        # cutoff=0.0: bond dimensions must not drift mid-sweep, since the
+        # plaquette environments and bra are only recomputed per
+        # ``compute_envs_every`` - any change in bond size between env
+        # computations causes a dimension mismatch in the fitting network
+        ket_plq.gate_(
+            G, where, contract="reduce-split", max_bond=max_bond, cutoff=0.0
+        )
         for site in tags_plq:
             bra_plq[site].modify(data=conj(ket_plq[site].data))
 
@@ -875,7 +881,10 @@ def gate_full_update_autodiff_fidelity(
 
     # make initial guess the simple gate tensors
     if init_simple_guess:
-        ket_plq.gate_(G, where, contract="reduce-split", max_bond=max_bond)
+        # cutoff=0.0: see note in gate_full_update_als
+        ket_plq.gate_(
+            G, where, contract="reduce-split", max_bond=max_bond, cutoff=0.0
+        )
         for site in tags_plq:
             bra_plq[site].modify(data=conj(ket_plq[site].data))
 
