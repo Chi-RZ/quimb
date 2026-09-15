@@ -33,6 +33,11 @@ class L2BP(BeliefPropagationCommon):
         of the old message into the new one, with the final message being
         ``damping * old + (1 - damping) * new``. This makes convergence more
         reliable but slower.
+    diis : bool or dict, optional
+        Whether to use direct inversion in the iterative subspace to help
+        converge the messages by extrapolating to low error guesses. If a
+        dict, should contain options for the DIIS algorithm. The relevant
+        options are {`max_history`, `beta`, `rcond`}.
     update : {'sequential', 'parallel'}, optional
         Whether to update messages sequentially (newly computed messages are
         immediately used for other updates in the same iteration round) or in
@@ -79,6 +84,7 @@ class L2BP(BeliefPropagationCommon):
         site_tags=None,
         *,
         damping=0.0,
+        diis=False,
         update="sequential",
         normalize=None,
         distance=None,
@@ -92,6 +98,7 @@ class L2BP(BeliefPropagationCommon):
         super().__init__(
             tn,
             damping=damping,
+            diis=diis,
             update=update,
             normalize=normalize,
             distance=distance,
@@ -194,7 +201,7 @@ class L2BP(BeliefPropagationCommon):
 
             def _symmetrize_fn(x):
                 N = ar.ndim(x)
-                perm = (*range(N // 2, N), *range(0, N // 2))
+                perm = (*range(N // 2, N), *range(N // 2))
                 # XXX: do this blockwise for block/fermi arrays?
                 return x + _conj(_transpose(x, perm))
 
@@ -430,21 +437,18 @@ class L2BP(BeliefPropagationCommon):
                 Rl, Rr, **compress_opts
             )
 
-            Pl = ar.do("reshape", Pl, (*bix_sizes, -1))
-            Pr = ar.do("reshape", Pr, (-1, *bix_sizes))
-
-            ltn = tn.select(i)
-            rtn = tn.select(j)
-
-            new_lix = [qtn.rand_uuid() for _ in bix]
-            new_rix = [qtn.rand_uuid() for _ in bix]
-            new_bix = [qtn.rand_uuid()]
-            ltn.reindex_(dict(zip(bix, new_lix)))
-            rtn.reindex_(dict(zip(bix, new_rix)))
-
-            # ... and insert the new projectors in place
-            tn |= qtn.Tensor(Pl, inds=new_lix + new_bix, tags=(i,))
-            tn |= qtn.Tensor(Pr, inds=new_bix + new_rix, tags=(j,))
+            tn.insert_projectors_between_regions_(
+                i,
+                j,
+                Pl,
+                Pr,
+                left_inds=bix,
+                right_inds=bix,
+                left_dims=bix_sizes,
+                right_dims=bix_sizes,
+                new_ltags=i,
+                new_rtags=j,
+            )
 
         if not lazy:
             for st in self.site_tags:

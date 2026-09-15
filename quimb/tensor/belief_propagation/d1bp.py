@@ -3,6 +3,7 @@
 - assumes no hyper indices, only standard bonds.
 - assumes a single ('dense') tensor per site
 - works directly on the '1-norm' i.e. scalar tensor network
+- supports sparse COO-format tensors, which have specialized numba kernels
 
 This is the simplest version of belief propagation, and is useful for
 simple investigations.
@@ -14,16 +15,24 @@ import autoray as ar
 
 from quimb.tensor import Tensor, TensorNetwork, rand_uuid
 from quimb.tensor.contraction import array_contract
+from quimb.tensor.networking import NetworkPatch
 from quimb.utils import oset
 
 from .bp_common import (
     BeliefPropagationCommon,
     combine_local_contractions,
     normalize_message_pair,
+    parse_gloops_edge_induced,
     process_loop_series_expansion_weights,
 )
 from .hd1bp import (
     compute_all_tensor_messages_tree,
+)
+from .sparse_ops import (
+    compute_all_tensor_messages_coo,
+    contract_tensor_messages_coo,
+    parse_coo,
+    sum_all_but_axis_coo,
 )
 
 
@@ -39,6 +48,9 @@ def initialize_messages(tn, fill_fn=None):
             if fill_fn is not None:
                 d = t_from.ind_size(ix)
                 m = fill_fn((d,))
+            elif parse_coo(t_from.data) is not None:
+                # sparse COO tensor
+                m = sum_all_but_axis_coo(t_from.data, t_from.inds.index(ix))
             else:
                 m = array_contract(
                     arrays=(t_from.data,),
@@ -56,6 +68,9 @@ class D1BP(BeliefPropagationCommon):
     hyper indices (i.e. a standard tensor network). This is the simplest
     version of belief propagation.
 
+    The tensors can be sparse COO-format tensors, either from pydata-sparse or
+    scipy-sparse.
+
     Parameters
     ----------
     tn : TensorNetwork
@@ -68,6 +83,11 @@ class D1BP(BeliefPropagationCommon):
         of the old message into the new one, with the final message being
         ``damping * old + (1 - damping) * new``. This makes convergence more
         reliable but slower.
+    diis : bool or dict, optional
+        Whether to use direct inversion in the iterative subspace to help
+        converge the messages by extrapolating to low error guesses. If a
+        dict, should contain options for the DIIS algorithm. The relevant
+        options are {`max_history`, `beta`, `rcond`}.
     update : {'sequential', 'parallel'}, optional
         Whether to update messages sequentially (newly computed messages are
         immediately used for other updates in the same iteration round) or in
@@ -117,6 +137,7 @@ class D1BP(BeliefPropagationCommon):
         *,
         messages=None,
         damping=0.0,
+        diis=False,
         update="sequential",
         normalize=None,
         distance=None,
@@ -125,14 +146,20 @@ class D1BP(BeliefPropagationCommon):
         contract_every=None,
         inplace=False,
     ):
+        # check for pydata-sparse.COO or scipy-sparse.COO tensors
+        # -> use optimized sparse array + dense message contractions if so
+        self.sparse = any(parse_coo(t.data) is not None for t in tn)
+
         super().__init__(
             tn=tn,
             damping=damping,
+            diis=diis,
             update=update,
             normalize=normalize,
             distance=distance,
             contract_every=contract_every,
             inplace=inplace,
+            backend="numpy" if self.sparse else None,
         )
 
         self.local_convergence = local_convergence
@@ -166,11 +193,15 @@ class D1BP(BeliefPropagationCommon):
 
         def _compute_ms(tid):
             t = self.tn.tensor_map[tid]
-            new_ms = compute_all_tensor_messages_tree(
-                t.data,
-                [self.messages[ix, tid] for ix in t.inds],
-                self.backend,
-            )
+            ms = [self.messages[ix, tid] for ix in t.inds]
+            coo = parse_coo(t.data)
+            if coo is not None:
+                # compute via optimized sparse contraction
+                new_ms = compute_all_tensor_messages_coo(coo, ms)
+            else:
+                new_ms = compute_all_tensor_messages_tree(
+                    t.data, ms, self.backend
+                )
             new_ms = [self._normalize_fn(m) for m in new_ms]
             new_ks = [self.key_pairs[ix, tid] for ix in t.inds]
 
@@ -346,17 +377,41 @@ class D1BP(BeliefPropagationCommon):
             t.vector_reduce_(ix, self.messages[ix, tid])
         return tnr
 
-    def get_cluster_excited(self, tids):
-        """Get the local tensor network for ``tids`` with BP messages inserted
-        on the boundary and excitation projectors inserted on the inner bonds.
-        See https://arxiv.org/abs/2409.03108 for more details.
+    def get_cluster_excited(self, gloop):
+        """Build the local loop excitation tensor network for ``gloop``.
+
+        Insert BP messages on boundary bonds and excitation projectors on
+        all or selected inner bonds. See https://arxiv.org/abs/2409.03108.
+
+        Parameters
+        ----------
+        gloop : sequence[int] or NetworkPatch
+            The region ``tids``. A
+            :class:`~quimb.tensor.networking.NetworkPatch` also selects the
+            subset of inner excited bonds. Non-excited inner bonds are treated
+            like boundary bonds. See
+            :func:`~quimb.tensor.networking.gen_gloops_edge_induced`.
+
+        Returns
+        -------
+        TensorNetwork
         """
+        if isinstance(gloop, NetworkPatch):
+            tids = gloop.tids
+            excited = gloop.inds
+        else:
+            # excite every inner bond
+            tids = gloop
+            excited = None
+
         stn = self.tn._select_tids(tids, virtual=False)
 
-        for ix, tids in tuple(stn.ind_map.items()):
-            if ix in stn._inner_inds:
+        for ix, stids in tuple(stn.ind_map.items()):
+            if (ix in stn._inner_inds) and (
+                (excited is None) or (ix in excited)
+            ):
                 # insert inner excitation projector
-                tidl, tidr = tids
+                tidl, tidr = stids
                 ml = self.messages[ix, tidl]
                 mr = self.messages[ix, tidr]
                 # form outer product
@@ -366,11 +421,10 @@ class D1BP(BeliefPropagationCommon):
                 # absorb into one of tensors
                 stn.tensor_map[tidr].gate_(pe, ix)
             else:
-                # insert boundary message
-                (tid,) = tids
-                m = self.messages[ix, tid]
-                t = stn.tensor_map[tid]
-                t.vector_reduce_(ix, m)
+                # messages cut an unexcited inner bond like a boundary bond
+                for tid in tuple(stids):
+                    t = stn.tensor_map[tid]
+                    t.vector_reduce_(ix, self.messages[ix, tid])
 
         return stn
 
@@ -390,10 +444,11 @@ class D1BP(BeliefPropagationCommon):
 
         Parameters
         ----------
-        gloops : None, int, "min" or iterable of tuples, optional
-            The generalized loops to use, an integer to generate all loops up
-            to that size, or ``None``/``"min"`` for the automatic size, see
-            :func:`~quimb.tensor.networking.gen_gloops`.
+        gloops : None, int, "min" or iterable, optional
+            Loops or regions to use. An integer generates all loops up to that
+            size. ``None`` and ``"min"`` use an automatic size. An iterable
+            can contain explicit regions of ``tids`` or ``NetworkPatch``
+            objects.
         multi_excitation_correct : bool, optional
             Whether to use the multi-excitation correction. If ``True``, then
             the free energy is refined iteratively until self consistent.
@@ -414,23 +469,19 @@ class D1BP(BeliefPropagationCommon):
         # accrues BP estimate into self.sign and self.exponent
         self.normalize_tensors()
 
-        if (gloops is None) or isinstance(gloops, (int, str)):
-            gloops = tuple(self.tn.gen_gloops(max_size=gloops))
-        else:
-            gloops = tuple(gloops)
+        gloops = parse_gloops_edge_induced(self.tn, gloops)
 
         weights = {}
         for gloop in gloops:
-            # get local tensor network with boundary
-            # messages and exctiation projectors
             etn = self.get_cluster_excited(gloop)
-            # contract it to get local weight!
-            weights[tuple(gloop)] = etn.contract(
-                optimize=optimize, **contract_opts
-            )
+            w = etn.contract(optimize=optimize, **contract_opts)
+            # loops with the same tensor support use one suppression factor
+            key = tuple(sorted(gloop.tids))
+            weights[key] = weights.get(key, 0.0) + w
 
         return process_loop_series_expansion_weights(
             weights,
+            num_tensors=self.tn.num_tensors,
             mantissa=self.sign,
             exponent=self.exponent,
             multi_excitation_correct=multi_excitation_correct,
@@ -442,6 +493,14 @@ class D1BP(BeliefPropagationCommon):
     def local_tensor_contract(self, tid):
         """Contract the messages around tensor ``tid``."""
         t = self.tn.tensor_map[tid]
+
+        coo = parse_coo(t.data)
+        if coo is not None:
+            # perform optimized sparse contraction
+            return contract_tensor_messages_coo(
+                coo, [self.messages[ix, tid] for ix in t.inds]
+            )
+
         arrays = [t.data]
         inputs = [tuple(range(t.ndim))]
         for i, ix in enumerate(t.inds):

@@ -24,6 +24,7 @@ from ..tensor_core import (
     bonds,
     bonds_size,
     oset,
+    parse_site_tag_groups,
     rand_uuid,
     tags_to_oset,
 )
@@ -346,9 +347,8 @@ def parse_boundary_sequence(sequence):
     """Ensure ``sequence`` is a tuple of boundary sequence strings from
     ``{'xmin', 'xmax', 'ymin', 'ymax'}``
     """
-    if isinstance(sequence, str):
-        if sequence in BOUNDARY_SEQUENCE_VALID:
-            return (sequence,)
+    if isinstance(sequence, str) and sequence in BOUNDARY_SEQUENCE_VALID:
+        return (sequence,)
     return tuple(BOUNDARY_SEQUENCE_MAP[d] for d in sequence)
 
 
@@ -1287,70 +1287,49 @@ class TensorNetwork2D(TensorNetworkGen):
         site_tag = r2d.site_tag
         istep = r2d.istep
 
-        def _do_compress(site_tag_tmps):
-            # split off the boundary network
-            tn_boundary = self.partition(site_tag_tmps, inplace=True)[1]
+        def _do_compress(site_tags):
+            site_tags, untag_groups = parse_site_tag_groups(self, site_tags)
+            tn_boundary = self.partition(site_tags, inplace=True)[1]
 
-            # compress it inplace
             tensor_network_1d_compress(
                 tn_boundary,
                 max_bond=max_bond,
                 cutoff=cutoff,
                 method=method,
-                site_tags=site_tag_tmps,
+                site_tags=site_tags,
                 inplace=True,
                 **compress_opts,
             )
 
-            # recombine with the main network
             self.add_tensor_network(tn_boundary, virtual=True)
 
-        # maybe compress the initial row, which may be multiple layers
-        # and have effective bond dimension > max_bond already
-        site_tag_tmps = [site_tag(r2d.sweep[0], j) for j in r2d.sweep_other]
-        if any(len(self.tag_map[st]) > 1 for st in site_tag_tmps):
-            _do_compress(site_tag_tmps)
+            # also clean tensors replaced during compression
+            untag_groups(self)
 
-        site_tag_tmps = [f"__ST{j}__" for j in r2d.sweep_other]
+        # the initial row can contain several layers
+        site_tags = [site_tag(r2d.sweep[0], j) for j in r2d.sweep_other]
+        if any(len(self.tag_map[st]) > 1 for st in site_tags):
+            _do_compress(site_tags)
 
         if layer_tags is None:
             layer_tags = [None]
 
-        # we explicitly track the temporary tags to drop later, so we don't
-        # have to track all the env networks they might appear in
-        record = {}
-
         for i in r2d.sweep[:-1]:
             for layer_tag in layer_tags:
-                for j, st in zip(r2d.sweep_other, site_tag_tmps):
-                    # group outer single tensor with inner tensor(s)
-                    tag1 = site_tag(i, j)  # outer
-                    tag2 = site_tag(i + istep, j)  # inner
-                    if layer_tag is None:
-                        # tag and compress any inner tensors
-                        self.add_tag(
-                            st,
-                            where=(tag1, tag2),
-                            which="any",
-                            record=record,
-                        )
-                    else:
-                        # only tag and compress one inner layer
-                        self.add_tag(st, where=(tag1,), record=record)
-                        self.add_tag(
-                            st,
-                            where=(tag2, layer_tag),
-                            which="all",
-                            record=record,
-                        )
+                if layer_tag is None:
+                    # group all tensors tagged (i,j) OR (i+istep,j)
+                    site_tags = [
+                        (site_tag(i, j), site_tag(i + istep, j))
+                        for j in r2d.sweep_other
+                    ]
+                else:
+                    # group all tagged (i,j) OR ((i+istep,j) AND layer_tag)
+                    site_tags = [
+                        (site_tag(i, j), (site_tag(i + istep, j), layer_tag))
+                        for j in r2d.sweep_other
+                    ]
 
-                _do_compress(site_tag_tmps)
-
-        # rewind *all* the temporary tags
-        self.drop_tags(site_tag_tmps)
-        # even those not in final boundary
-        for t, t_tmp_tags in record.items():
-            t.drop_tags(t_tmp_tags)
+                _do_compress(site_tags)
 
     def _contract_boundary_core(
         self,
@@ -3099,7 +3078,7 @@ class TensorNetwork2D(TensorNetworkGen):
 
         # next we form horizontal strips and contract from both left and right
         #     for each row
-        y_envs = dict()
+        y_envs = {}
         for i in range(self.Lx - x_bsz + 1):
             #
             #      ●━━━●━━━●━━━●━━━●━━━●━━━●━━━●━━━●━━━●
@@ -3141,7 +3120,7 @@ class TensorNetwork2D(TensorNetworkGen):
 
         # then range through all the possible plaquettes, selecting the correct
         # boundary tensors from either the column or row environments
-        plaquette_envs = dict()
+        plaquette_envs = {}
         for i0, j0 in product(
             range(self.Lx - x_bsz + 1), range(self.Ly - y_bsz + 1)
         ):
@@ -3220,7 +3199,7 @@ class TensorNetwork2D(TensorNetworkGen):
 
         # next we form vertical strips and contract from both top and bottom
         #     for each column
-        x_envs = dict()
+        x_envs = {}
         for j in range(self.Ly - y_bsz + 1):
             #
             #        y_bsz
@@ -3269,7 +3248,7 @@ class TensorNetwork2D(TensorNetworkGen):
 
         # then range through all the possible plaquettes, selecting the correct
         # boundary tensors from either the column or row environments
-        plaquette_envs = dict()
+        plaquette_envs = {}
         for i0, j0 in product(
             range(self.Lx - x_bsz + 1), range(self.Ly - y_bsz + 1)
         ):
@@ -3405,9 +3384,7 @@ class TensorNetwork2D(TensorNetworkGen):
         if first_contract is None:
             if x_bsz > y_bsz:
                 first_contract = "y"
-            elif y_bsz > x_bsz:
-                first_contract = "x"
-            elif self.Lx >= self.Ly:
+            elif (y_bsz > x_bsz) or (self.Lx >= self.Ly):
                 first_contract = "x"
             else:
                 first_contract = "y"
@@ -4216,7 +4193,7 @@ class TensorNetwork2DVector(TensorNetwork2D, TensorNetworkGenVector):
             # can perform boundary contraction inplace on new norm network
             inplace=True,
             # but want to unwrap final value, not leave as tensor network
-            final_contract_opts=dict(inplace=False),
+            final_contract_opts={"inplace": False},
             **contract_opts,
         )
 
@@ -4303,7 +4280,7 @@ class TensorNetwork2DVector(TensorNetwork2D, TensorNetworkGenVector):
             plaquette_env_options["mode"] = mode
             plaquette_env_options["layer_tags"] = layer_tags
 
-            plaquette_envs = dict()
+            plaquette_envs = {}
             for x_bsz, y_bsz in calc_plaquette_sizes(terms.keys(), autogroup):
                 plaquette_envs.update(
                     norm.compute_plaquette_environments(
@@ -4321,7 +4298,7 @@ class TensorNetwork2DVector(TensorNetwork2D, TensorNetworkGenVector):
             p = plaquette_map[where]
             plaq2coo[p].append((where, G))
 
-        expecs = dict()
+        expecs = {}
         for p in plaq2coo:
             # site tags for the plaquette
             sites = tuple(map(ket.site_tag, plaquette_to_sites(p)))
@@ -4800,15 +4777,16 @@ class PEPS(TensorNetwork2DVector, TensorNetwork2DFlat):
             shp = []
 
             for which in shape:
-                if (which == "u") and (cyclicx or (i < Lx - 1)):  # bond up
-                    shp.append(bond_dim)
-                elif (which == "r") and (
-                    cyclicy or (j < Ly - 1)
-                ):  # bond right
-                    shp.append(bond_dim)
-                elif (which == "d") and (cyclicx or (i > 0)):  # bond down
-                    shp.append(bond_dim)
-                elif (which == "l") and (cyclicy or (j > 0)):  # bond left
+                if (
+                    # bond up
+                    ((which == "u") and (cyclicx or (i < Lx - 1)))
+                    # bond right
+                    or ((which == "r") and (cyclicy or (j < Ly - 1)))
+                    # bond down
+                    or ((which == "d") and (cyclicx or (i > 0)))
+                    # bond left
+                    or ((which == "l") and (cyclicy or (j > 0)))
+                ):
                     shp.append(bond_dim)
                 elif which == "p":
                     shp.append(phys_dim)
@@ -5002,8 +4980,8 @@ class PEPS(TensorNetwork2DVector, TensorNetwork2DFlat):
 
         if isinstance(site_map, dict):
             getarray = site_map.get
-            Lx = max(i for i, j in site_map.keys()) + 1
-            Ly = max(j for i, j in site_map.keys()) + 1
+            Lx = max(i for i, j in site_map) + 1
+            Ly = max(j for i, j in site_map) + 1
         else:
 
             def getarray(ij):
@@ -5272,13 +5250,12 @@ class PEPO(TensorNetwork2DOperator, TensorNetwork2DFlat):
         for i, j in product(range(Lx), range(Ly)):
             shp = []
             for which in shape:
-                if (which == "u") and (cyclicx or (i < Lx - 1)):
-                    shp.append(bond_dim)
-                elif (which == "r") and (cyclicy or (j < Ly - 1)):
-                    shp.append(bond_dim)
-                elif (which == "d") and (cyclicx or (i > 0)):
-                    shp.append(bond_dim)
-                elif (which == "l") and (cyclicy or (j > 0)):
+                if (
+                    ((which == "u") and (cyclicx or (i < Lx - 1)))
+                    or ((which == "r") and (cyclicy or (j < Ly - 1)))
+                    or ((which == "d") and (cyclicx or (i > 0)))
+                    or ((which == "l") and (cyclicy or (j > 0)))
+                ):
                     shp.append(bond_dim)
                 elif which in ("b", "k"):
                     shp.append(phys_dim)
@@ -5584,7 +5561,7 @@ def calc_plaquette_map(plaquettes):
     # sort in descending total plaquette size
     plqs = sorted(plaquettes, key=lambda p: (-p[1][0] * p[1][1], p))
 
-    mapping = dict()
+    mapping = {}
     for p in plqs:
         sites = plaquette_to_sites(p)
         for site in sites:

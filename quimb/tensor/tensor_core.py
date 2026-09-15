@@ -102,6 +102,7 @@ from .networking import (
     connected_bipartitions,
     gen_all_paths_between_tids,
     gen_gloops,
+    gen_gloops_edge_induced,
     gen_inds_connected,
     gen_loops,
     gen_patches,
@@ -149,6 +150,90 @@ def tags_to_oset(tags):
         return tags.copy()
     else:
         return oset(tags)
+
+
+def parse_site_tag_groups(tn, site_tags, tag_id="__GST{}__"):
+    """Turn possible groups of tags specifying sites into single temporary
+    tags. The tensor network is tagged inplace with any needed temporary tags,
+    and the new sequence of single site tags is returned. A callable is also
+    returned that removes the temporary tags from the network it is called on.
+
+    Parameters
+    ----------
+    tn : TensorNetwork or sequence of TensorNetwork
+        The tensor network(s) to tag inplace. Each tensor should belong to
+        exactly one site given by the tags below.
+    site_tags : None or sequence
+        Tags that identify and order sites. Each element can be a single tag
+        or a group. Within a group, each element can be a single tag, matching
+        any tensors with that tag, or a nested sequence of tags, matching
+        tensors with *all* of them only. ``None`` is returned unchanged.
+    tag_id : str, optional
+        Format string for temporary tags.
+
+    Returns
+    -------
+    site_tags : None or tuple[str]
+        One tag per site. A temporary tag replaces each group.
+    untag_groups : callable
+        Removes temporary tags from the given networks and all tensors tagged
+        by this function. This includes tensors since removed from a network.
+
+    Examples
+    --------
+
+        >>> site_tags = [
+        ...     "I0",                   # tag I0
+        ...     ("I1", "I2"),           # tag I1 or I2
+        ...     ("I3", ("I4", "KET")),  # tag I3, or tags I4 and KET
+        ... ]
+
+    """
+    if site_tags is None:
+        return None, lambda *tns: None
+
+    if all(isinstance(st, str) for st in site_tags):
+        return tuple(site_tags), lambda *tns: None
+
+    if isinstance(tn, TensorNetwork):
+        tns = (tn,)
+    else:
+        tns = tuple(tn)
+
+    new_site_tags = []
+    temp_tags = []
+    # algorithms can drop tagged initial tensors, so we record them as well
+    tagged_tensors = {}
+
+    for i, group in enumerate(site_tags):
+        if isinstance(group, str):
+            new_site_tags.append(group)
+            continue
+
+        group = tuple(group)
+        if (len(group) == 1) and isinstance(group[0], str):
+            new_site_tags.append(group[0])
+            continue
+
+        # is a group
+        site_tag = tag_id.format(i)
+        new_site_tags.append(site_tag)
+        temp_tags.append(site_tag)
+        for where in group:
+            # "all" accepts one tag or a sequence of tags
+            for tni in tns:
+                tni.add_tag(
+                    site_tag, where=where, which="all", record=tagged_tensors
+                )
+
+    def untag_groups(*tns):
+        for tni in tns:
+            tni.drop_tags(temp_tags)
+        while tagged_tensors:
+            tensor, tensor_temp_tags = tagged_tensors.popitem()
+            tensor.drop_tags(tensor_temp_tags)
+
+    return tuple(new_site_tags), untag_groups
 
 
 def sortedtuple(x):
@@ -396,7 +481,7 @@ def tensor_split(
     method="auto",
     absorb="auto",
     max_bond=None,
-    cutoff=1e-10,
+    cutoff="auto",
     cutoff_mode="rel",
     renorm=None,
     get=None,
@@ -437,8 +522,8 @@ def tensor_split(
         - ``'svd:eig'``: full SVD via eigendecomposition, allowing all
           truncation options. This can be faster than the standard SVD, but
           entails some loss of precision.
-        - ``'svd:rand'``: low-rank SVD via randomized projection, allows
-          (and is only beneficial for) static truncation
+        - ``'svd:rand'``: low-rank SVD via randomized projection, allowing
+          static and non-cumulative dynamic truncation.
         - ``'qr'``: QR decomposition, by default left factor is isometric.
         - ``'qr:cholesky'``: QR decomposition via Cholesky factorization, by
           default left factor is isometric. This can be faster than the
@@ -492,25 +577,27 @@ def tensor_split(
     max_bond : None or int
         If integer, the maximum number of singular values to keep, regardless
         of ``cutoff``.
-    cutoff : float, optional
+    cutoff : float or "auto", optional
         The threshold below which to discard singular values, only applies to
-        rank revealing methods (not QR, LQ, or cholesky etc.).
-    cutoff_mode : {'rsum2', 'rel', 'abs', 'sum2', 'rsum1', 'sum1'}, optional
+        rank revealing methods (not QR, LQ, or cholesky etc.). With
+        ``"auto"``, use ``1e-10`` for exact methods and no cutoff for
+        randomized SVD.
+    cutoff_mode : {"rel", "rsum2", "rsum1", "abs", "sum2", "sum1"}, optional
         How to interpret ``cutoff`` when discarding singular values:
 
         - ``'rel'``: values less than ``cutoff * s[0]`` discarded.
-        - ``'abs'``: values less than ``cutoff`` discarded.
-        - ``'sum2'``: sum squared of values discarded must be ``< cutoff``.
         - ``'rsum2'``: sum squared of values discarded must be less than
           ``cutoff`` times the total sum of squared values.
-        - ``'sum1'``: sum values discarded must be ``< cutoff``.
         - ``'rsum1'``: sum of values discarded must be less than ``cutoff``
           times the total sum of values.
+        - ``'abs'``: values less than ``cutoff`` discarded.
+        - ``'sum2'``: sum squared of values discarded must be ``< cutoff``.
+        - ``'sum1'``: sum values discarded must be ``< cutoff``.
 
     renorm : int or bool, optional
         Whether to renormalize the kept singular values to maintain the
         Frobenius or nuclear norm. ``0`` or ``False`` means no renormalization.
-        ``True`` automatically picks the power based on ``cutoff_mode``.
+        ``True`` uses power 1 for ``sum1``/``rsum1`` and power 2 otherwise.
     ltags : sequence of str, optional
         Add these new tags to the left tensor.
     rtags : sequence of str, optional
@@ -2648,17 +2735,44 @@ class Tensor:
         new_ind_pair_diag, inplace=True
     )
 
-    def conj(self, inplace=False):
-        """Conjugate this tensors data (does nothing to indices)."""
+    def conj(self, inplace=False, output_inds=None):
+        """Conjugate this tensor's data without changing its indices.
+
+        Parameters
+        ----------
+        inplace : bool, optional
+            Whether to conjugate this tensor in place.
+        output_inds : sequence of str, optional
+            Only matters if this tensor is fermionic. If so, which indices to
+            consider as 'outer' indices of a global network, if any of those
+            are non-dual, the corresponding axes are phase-flipped to give the
+            correct local fermionic signs. Unlike `TensorNetwork.conj`, no
+            indices are automatically inferred.
+
+        Returns
+        -------
+        Tensor
+        """
         t = self if inplace else self.copy()
         t.modify(apply=conj, left_inds=t.left_inds)
+
+        if output_inds and t.isfermionic():
+            data = t.data
+            axs = tuple(
+                ax
+                for ax, ix in enumerate(t.inds)
+                if (ix in output_inds) and not data.indices[ax].dual
+            )
+            if axs:
+                t.modify(data=data.phase_flip(*axs))
+
         return t
 
     conj_ = functools.partialmethod(conj, inplace=True)
 
     @property
     def H(self):
-        """Conjugate this tensors data (does nothing to indices)."""
+        """Conjugate this tensor's data without changing its indices."""
         return self.conj()
 
     @property
@@ -4756,13 +4870,18 @@ class TensorNetwork:
             Whether to mangle the inner indices of the network. If a string is
             given, it will be appended to the index names.
         output_inds : sequence of str, optional
-            If given, the indices to mangle will be restricted to those not in
-            this list. This is only needed for (hyper) tensor networks where
-            output indices are not given simply by those that appear once.
+            Which indices to treat as 'outer', which matters for fermionic
+            conjugation as well as index mangling. Computed as every index
+            that appears exactly once if not given (which may be incorrect if
+            A) hyper-indices are present or B) you are viewing a sub-network).
+            For fermionic networks, outer indices are phase flipped based on
+            their dualness. For hyper tensor networks, outer indices are
+            not mangled, even if they appear twice or more.
         phase_dual : bool, optional
             If the tensor data is fermionic, whether to phase flip any dual
             outer indices, to ensure the correct behavior when forming local
-            cluster states. By default ``True``.
+            cluster states. By default ``True``. See `output_inds` for which
+            indices are considered outer.
         inplace : bool, optional
             Whether to perform the conjugation inplace or not.
 
@@ -4772,8 +4891,17 @@ class TensorNetwork:
         """
         tn = self if inplace else self.copy()
 
+        if phase_dual and tn.isfermionic():
+            # select indices eligible for fermionic conjugation phases
+            if output_inds is None:
+                phase_inds = oset(tn.outer_inds())
+            else:
+                phase_inds = tags_to_oset(output_inds)
+        else:
+            phase_inds = None
+
         for t in tn:
-            t.conj_()
+            t.conj_(output_inds=phase_inds)
 
         if mangle_inner:
             append = None if mangle_inner is True else str(mangle_inner)
@@ -4785,19 +4913,6 @@ class TensorNetwork:
                 which = oset(tn.ind_map) - tags_to_oset(output_inds)
 
             tn.mangle_inner_(append=append, which=which)
-
-        if phase_dual and tn.isfermionic():
-            # if we have fermionic data, need to phase dual outer indices
-            outer_inds = tn.outer_inds()
-            for t in tn:
-                data = t.data
-                dual_outer_axs = tuple(
-                    ax
-                    for ax, ix in enumerate(t.inds)
-                    if (ix in outer_inds) and not data.indices[ax].dual
-                )
-                if dual_outer_axs:
-                    t.modify(data=data.phase_flip(*dual_outer_axs))
 
         return tn
 
@@ -7305,6 +7420,7 @@ class TensorNetwork:
     gen_paths_loops = gen_paths_loops
     gen_sloops = gen_sloops
     gen_gloops = gen_gloops
+    gen_gloops_edge_induced = gen_gloops_edge_induced
     get_local_patch = get_local_patch
     get_path_between_tids = get_path_between_tids
     get_loop_union = get_loop_union
@@ -10135,6 +10251,7 @@ class TensorNetwork:
         tn = self
         bra_map = dict(ixmap)
         environment_tensors = []
+        message_inds = oset()
         if gauges:
             from .belief_propagation.d2bp import D2BP
 
@@ -10183,6 +10300,7 @@ class TensorNetwork:
 
                     bix = rand_uuid()
                     bra_map[ix] = bix
+                    message_inds.add(bix)
                     environment_tensors.append(Tensor(m, inds=(bix, ix)))
 
             else:
@@ -10191,7 +10309,14 @@ class TensorNetwork:
                 )
 
         # contract to dense array
-        tnd = tn.reindex(bra_map).conj_() & tn
+        bra = tn.reindex(bra_map)
+        if bra.isfermionic():
+            # message tensors already carry the required fermionic phases
+            phase_inds = bra._outer_inds - message_inds
+        else:
+            phase_inds = None
+        bra.conj_(output_inds=phase_inds)
+        tnd = bra & tn
         for tm in environment_tensors:
             tnd |= tm
         XX = tnd.to_dense(lix, rix, **contract_opts)
@@ -10203,6 +10328,132 @@ class TensorNetwork:
             right=(side == "right"),
             **reduce_opts,
         )
+
+    def insert_projectors_between_regions(
+        self,
+        ltags,
+        rtags,
+        Pl,
+        Pr,
+        *,
+        left_inds=None,
+        right_inds=None,
+        bond_ind=None,
+        left_dims=None,
+        right_dims=None,
+        select_which="any",
+        new_tags=None,
+        new_ltags=None,
+        new_rtags=None,
+        inplace=False,
+    ):
+        r"""Insert a pair of already computed 'projector' arrays between two
+        tensor-network regions::
+
+            A──A───B──B           A──A─╮     ╭─B──B
+            │  │   │  │    -->    │  │ Pl━━━Pr |  |
+            A──A───B──B           A──A─╯  :  ╰─B──B
+                : :                       :
+                : right_inds              bond_ind
+            left_inds
+
+        The projectors should use the fused order specified by ``left_inds``
+        and ``right_inds`` respectively. By default, these are equal and
+        calculated by `bonds` called on the two regions. The left projector
+        should have shape ``(d, new_bond_dim)`` and the right projector shape
+        ``(new_bond_dim, d)``, where ``d`` is the product of the respective
+        index dimensions.
+
+        Parameters
+        ----------
+        ltags : sequence of str
+            The tags of the tensors in the left region.
+        rtags : sequence of str
+            The tags of the tensors in the right region.
+        Pl : array_like
+            The left projector, with the fused original bonds as its first
+            dimension and the new bond as its second dimension.
+        Pr : array_like
+            The right projector, with the new bond as its first dimension and
+            the fused original bonds as its second dimension.
+        left_inds : sequence of str, optional
+            The ordered indices of the left region to connect to the left
+            projector, `Pl`. Calculated automatically as the bonds connecting
+            the two regions by default.
+        right_inds : sequence of str, optional
+            The ordered indices of the right region to connect to the right
+            projector, `Pr`. If not supplied, assumed to match ``left_inds``.
+        left_dims : sequence of int, optional
+            The dimensions of the left indices, ordered as they are fused in
+            ``Pl``. They are discovered automatically by default.
+        right_dims : sequence of int, optional
+            The dimensions of the right indices, ordered as they are fused in
+            ``Pr``. They are discovered automatically by default.
+        select_which : {'any', 'all'}, optional
+            How to select the regions based on the tags, see
+            :meth:`~quimb.tensor.tensor_core.TensorNetwork.select`.
+        new_tags : str or sequence of str, optional
+            The tag(s) to add to both new projector tensors.
+        new_ltags : str or sequence of str, optional
+            The tag(s) to add to only the new left projector tensor.
+        new_rtags : str or sequence of str, optional
+            The tag(s) to add to only the new right projector tensor.
+        bond_ind : str, optional
+            The index to use for the new bond between the projectors. A random
+            index is generated by default.
+        inplace : bool, optional
+            Whether to perform the insertion in-place.
+
+        Returns
+        -------
+        TensorNetwork
+            The tensor network with the projectors inserted.
+
+        See Also
+        --------
+        insert_compressor_between_regions, compute_oblique_projectors
+        """
+        tn = self if inplace else self.copy()
+
+        ltn = tn.select(ltags, which=select_which)
+        rtn = tn.select(rtags, which=select_which)
+
+        if left_inds is None:
+            left_inds = bonds(ltn, rtn)
+
+        if right_inds is None:
+            right_inds = left_inds
+
+        if left_dims is None:
+            left_dims = tuple(ltn.ind_size(ix) for ix in left_inds)
+
+        if right_dims is None:
+            right_dims = tuple(rtn.ind_size(ix) for ix in right_inds)
+
+        if bond_ind is None:
+            bond_ind = rand_uuid()
+
+        Pl = unfuse(Pl, axis=0, axis_dims=left_dims)
+        Pr = unfuse(Pr, axis=1, axis_dims=right_dims)
+
+        # cut the original bonds
+        new_lix = [rand_uuid() for _ in left_inds]
+        new_rix = [rand_uuid() for _ in right_inds]
+        ltn.reindex_(dict(zip(left_inds, new_lix)))
+        rtn.reindex_(dict(zip(right_inds, new_rix)))
+
+        # add the projectors as tagged tensors
+        new_tags = tags_to_oset(new_tags)
+        new_ltags = new_tags | tags_to_oset(new_ltags)
+        new_rtags = new_tags | tags_to_oset(new_rtags)
+        tn |= Tensor(Pl, inds=(*new_lix, bond_ind), tags=new_ltags)
+        tn |= Tensor(Pr, inds=(bond_ind, *new_rix), tags=new_rtags)
+
+        return tn
+
+    insert_projectors_between_regions_ = functools.partialmethod(
+        insert_projectors_between_regions, inplace=True
+    )
 
     def insert_compressor_between_regions(
         self,
@@ -10247,7 +10498,7 @@ class TensorNetwork:
             The cutoff to use for the compression.
         mode : {"oblique", "nystrom"}, optional
             How to compute the projectors.
-        select_which : {'any', 'all', 'none'}, optional
+        select_which : {'any', 'all'}, optional
             How to select the regions based on the tags, see
             :meth:`~quimb.tensor.tensor_core.TensorNetwork.select`.
         insert_into : TensorNetwork, optional
@@ -10298,7 +10549,7 @@ class TensorNetwork:
 
         See Also
         --------
-        compute_reduced_factor, select
+        insert_projectors_between_regions, compute_reduced_factor, select
         """
         contract_opts = ensure_dict(contract_opts)
         contract_opts.setdefault("optimize", optimize)
@@ -10417,30 +10668,23 @@ class TensorNetwork:
         else:
             raise ValueError(f"mode `{mode}` is invalid.")
 
-        # now we rewire the projectors back into the network
-        Pl = unfuse(Pl, axis=0, axis_dims=bix_sizes)
-        Pr = unfuse(Pr, axis=1, axis_dims=bix_sizes)
-
-        if insert_into is not None:
-            tn = insert_into
-        ltn = tn.select(ltags, which=select_which)
-        rtn = tn.select(rtags, which=select_which)
-
-        # finally cut the bonds
-        new_lix = [rand_uuid() for _ in bix]
-        new_rix = [rand_uuid() for _ in bix]
-        new_bix = [bond_ind]
-        ltn.reindex_(dict(zip(bix, new_lix)))
-        rtn.reindex_(dict(zip(bix, new_rix)))
-
-        # ... and insert the new projectors in place
-        new_tags = tags_to_oset(new_tags)
-        new_ltags = new_tags | tags_to_oset(new_ltags)
-        new_rtags = new_tags | tags_to_oset(new_rtags)
-        tn |= Tensor(Pl, inds=new_lix + new_bix, tags=new_ltags)
-        tn |= Tensor(Pr, inds=new_bix + new_rix, tags=new_rtags)
-
-        return tn
+        target = insert_into if insert_into is not None else tn
+        return target.insert_projectors_between_regions(
+            ltags,
+            rtags,
+            Pl,
+            Pr,
+            left_inds=bix,
+            right_inds=bix,
+            left_dims=bix_sizes,
+            right_dims=bix_sizes,
+            select_which=select_which,
+            new_tags=new_tags,
+            new_ltags=new_ltags,
+            new_rtags=new_rtags,
+            bond_ind=bond_ind,
+            inplace=True,
+        )
 
     insert_compressor_between_regions_ = functools.partialmethod(
         insert_compressor_between_regions, inplace=True
@@ -12674,16 +12918,34 @@ class PTensor(Tensor):
         """The backend inferred from the data."""
         return infer_backend(self.params)
 
+    def isfermionic(self):
+        """Check whether the generated tensor data is fermionic."""
+        return isfermionic(self.data)
+
     def _apply_function(self, fn):
         """Apply ``fn`` to the data array of this ``PTensor`` (lazily), by
         composing it with the current parametrized array function.
         """
         self._data.add_function(fn)
 
-    def conj(self, inplace=False):
-        """Conjugate this parametrized tensor - done lazily whenever the
-        ``.data`` attribute is accessed.
+    def conj(self, inplace=False, output_inds=None):
+        """Conjugate this parametrized tensor lazily.
+
+        Parameters
+        ----------
+        inplace : bool, optional
+            Whether to conjugate this tensor in place.
+        output_inds : sequence of str, optional
+            Indices to treat as outputs when applying fermionic conjugation
+            phases. Fermionic output phases are not supported for parametrized
+            tensors.
         """
+        if output_inds and self.isfermionic():
+            raise NotImplementedError(
+                "Fermionic PTensor conjugation with `output_inds` is not "
+                "supported."
+            )
+
         t = self if inplace else self.copy()
         t._apply_function(conj)
         return t

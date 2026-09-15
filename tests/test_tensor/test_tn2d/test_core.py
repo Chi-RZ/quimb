@@ -8,6 +8,13 @@ from numpy.testing import assert_allclose
 import quimb as qu
 import quimb.tensor as qtn
 
+from .. import (
+    bond_orientations,
+    make_symmetric_2d_tn,
+    requires_symmray,
+    symmetry_cases,
+)
+
 
 class TestPEPSConstruct:
     @pytest.mark.parametrize("Lx", [3, 4, 5])
@@ -266,6 +273,20 @@ class Test2DContract:
         xt = norm.contract_boundary(max_bond=27, layer_tags=["KET", "BRA"])
         assert xt == pytest.approx(xe, rel=1e-2)
 
+    @pytest.mark.parametrize("two_layer", [False, True])
+    def test_contract_2d_boundary_via_1d(self, two_layer):
+        psi = qtn.PEPS.rand(4, 4, 3, seed=42, tags="KET")
+        norm = psi.make_norm()
+        xe = norm.contract(all, optimize="auto-hq")
+
+        # retain a virtual view to detect leaked tags
+        view = norm.select(norm.x_tag(0))
+
+        layer_tags = ["KET", "BRA"] if two_layer else None
+        norm.contract_boundary_(max_bond=27, mode="dm", layer_tags=layer_tags)
+        assert norm.contract(all) == pytest.approx(xe, rel=5e-2)
+        assert not any(tag.startswith("__ST") for tag in view.tag_map)
+
     def test_contract_2d_full_bond(self):
         psi = qtn.PEPS.rand(4, 4, 3, seed=42, tags="KET")
         norm = psi.make_norm()
@@ -325,6 +346,59 @@ class Test2DContract:
         xt = norm.contract_hotrg(max_bond=5)
         assert xt == pytest.approx(xe, rel=1e-4)
 
+    @pytest.mark.parametrize(
+        "bond_dim,max_bond,dist,tolerance",
+        [
+            pytest.param(2, None, "normal", 1e-10, id="untruncated"),
+            # local rank is up to 16, so max_bond=8 truncates
+            pytest.param(4, 8, "uniform", 0.1, id="truncated"),
+        ],
+    )
+    @requires_symmray
+    @pytest.mark.parametrize("symmetry", symmetry_cases)
+    @pytest.mark.parametrize("bond_orientation", bond_orientations)
+    @pytest.mark.parametrize("direction", ["x", "y"])
+    def test_contract_hotrg_symmetric(
+        self,
+        symmetry,
+        bond_orientation,
+        direction,
+        bond_dim,
+        max_bond,
+        dist,
+        tolerance,
+    ):
+        """Check exact and truncated HOTRG contraction.
+
+        Cover tensor parity, bond orientation, and coarse-graining direction.
+        Uniform data gives a stable approximation when truncating.
+        """
+        seed = qu.utils.hash_kwargs_to_int(
+            method="hotrg",
+            symmetry=symmetry,
+            bond_orientation=bond_orientation,
+            direction=direction,
+            bond_dim=bond_dim,
+            max_bond=max_bond,
+            dist=dist,
+        )
+        tn = make_symmetric_2d_tn(
+            symmetry,
+            duals=bond_orientation,
+            bond_dim=bond_dim,
+            seed=seed,
+            dist=dist,
+        )
+
+        expected = tn.contract(all, optimize="auto-hq")
+        value = tn.contract_hotrg(
+            max_bond=max_bond,
+            cutoff=0.0,
+            sequence=(direction,),
+            reduce_opts={"method": "eigh"},
+        )
+        assert value == pytest.approx(expected, rel=tolerance)
+
     def test_ising_accuracy_regression(self):
         tn = qtn.TN2D_classical_ising_partition_function(16, 16, 0.44)
         for s in [("xmin",), ("xmax",), ("ymin",), ("ymax",)]:
@@ -335,10 +409,15 @@ class Test2DContract:
             assert Zap == pytest.approx(8.459419593253275e100, rel=3.9e-9)
 
     @pytest.mark.parametrize("mode", ["mps", "ctmrg", "hotrg"])
-    def test_cdl_rand_large(self, mode):
-        tn = qtn.TN2D_rand_hidden_loop(10, 10, seed=42, contract_sites=False)
+    @pytest.mark.parametrize("builder", ["loop", "cactus"])
+    def test_cdl_rand_large(self, mode, builder):
+        build_fn = {
+            "loop": qtn.TN2D_rand_hidden_loop,
+            "cactus": qtn.TN2D_rand_hidden_cactus,
+        }[builder]
+        tn = build_fn(10, 10, seed=42, contract_sites=False)
         Zex = tn.contract(...)
-        tn = qtn.TN2D_rand_hidden_loop(10, 10, seed=42, contract_sites=True)
+        tn = build_fn(10, 10, seed=42, contract_sites=True)
 
         if mode == "mps":
             Z = tn.contract_boundary(max_bond=16)
@@ -479,7 +558,7 @@ class Test2DContract:
         )
         ex = qu.expec(A, k)
 
-        opts = dict(cutoff=2e-3, max_bond=9, contract_optimize="auto-hq")
+        opts = {"cutoff": 2e-3, "max_bond": 9, "contract_optimize": "auto-hq"}
         e = peps.compute_local_expectation(
             terms, mode=mode, normalized=normalized, **opts
         )
@@ -499,13 +578,13 @@ class Test2DContract:
             qu.normalize(k)
         ex = qu.expec(H, k)
 
-        opts = dict(
-            mode=mode,
-            normalized=normalized,
-            cutoff=2e-3,
-            max_bond=16,
-            contract_optimize="auto-hq",
-        )
+        opts = {
+            "mode": mode,
+            "normalized": normalized,
+            "cutoff": 2e-3,
+            "max_bond": 16,
+            "contract_optimize": "auto-hq",
+        }
 
         # compute 2x1 and 1x2 plaquettes separately
         hterms = {coos: Hij for coos in peps.gen_horizontal_bond_coos()}

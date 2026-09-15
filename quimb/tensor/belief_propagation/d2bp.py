@@ -15,12 +15,14 @@ import operator
 import autoray as ar
 
 import quimb.tensor as qtn
+from quimb.tensor.networking import NetworkPatch
 from quimb.utils import check_opt, ensure_dict, oset
 
 from .bp_common import (
     BeliefPropagationCommon,
     combine_local_contractions,
     normalize_message_pair,
+    parse_gloops_edge_induced,
     process_loop_series_expansion_weights,
 )
 from .regions import gen_region_counts
@@ -135,6 +137,11 @@ class D2BP(BeliefPropagationCommon):
         of the old message into the new one, with the final message being
         ``damping * old + (1 - damping) * new``. This makes convergence more
         reliable but slower.
+    diis : bool or dict, optional
+        Whether to use direct inversion in the iterative subspace to help
+        converge the messages by extrapolating to low error guesses. If a
+        dict, should contain options for the DIIS algorithm. The relevant
+        options are {`max_history`, `beta`, `rcond`}.
     update : {'sequential', 'parallel'}, optional
         Whether to update messages sequentially (newly computed messages are
         immediately used for other updates in the same iteration round) or in
@@ -187,6 +194,7 @@ class D2BP(BeliefPropagationCommon):
         output_inds=None,
         optimize="auto-hq",
         damping=0.0,
+        diis=False,
         update="sequential",
         power=1.0,
         smudge=0.0,
@@ -200,6 +208,7 @@ class D2BP(BeliefPropagationCommon):
         super().__init__(
             tn=tn,
             damping=damping,
+            diis=diis,
             update=update,
             normalize=normalize,
             distance=distance,
@@ -349,14 +358,11 @@ class D2BP(BeliefPropagationCommon):
 
         t = self.tn.tensor_map[tid]
         ix_neighbors = {}
-        axs_output = []
 
         # first build initial messages from ix->tid
-        for ax, ix in enumerate(t.inds):
+        for ix in t.inds:
             if ix in self.output_inds:
                 # output index -> directly contract without message
-                # if fermionic we may need to phase flip -> record
-                axs_output.append(ax)
                 continue
 
             # bond index -> mangle for bra
@@ -382,15 +388,9 @@ class D2BP(BeliefPropagationCommon):
             # make sure touch_map entry exists
             self.touch_map.setdefault((ix, tid), {})
 
-        t_dag = t.conj().reindex_(self.index_dual_map)
-        if t_dag.isfermionic():
-            # need to phase dual output indices only
-            data = t_dag.data
-            axs_phase = tuple(
-                ax for ax in axs_output if not data.indices[ax].dual
-            )
-            if axs_phase:
-                t_dag.modify(data=data.phase_flip(*axs_phase))
+        # phase only output legs when forming a fermionic conjugate
+        t_dag = t.conj(output_inds=self.output_inds)
+        t_dag.reindex_(self.index_dual_map)
 
         self.tensor_dual_map[tid] = t_dag
         kix = t.inds
@@ -681,25 +681,36 @@ class D2BP(BeliefPropagationCommon):
         partial_trace_map=(),
         exclude=(),
     ):
-        """Get the local norm tensor network for ``tids`` with BP messages
-        inserted on the boundary and excitation projectors inserted on the
-        inner bonds. See arxiv.org/abs/2409.03108 for more details.
+        """Build the local loop excitation norm tensor network for ``tids``.
+
+        Insert BP messages on boundary bonds and excitation projectors on
+        all or selected inner bonds. See https://arxiv.org/abs/2409.03108.
 
         Parameters
         ----------
-        tids : iterable of hashable
-            The tensor ids to include in the cluster.
+        tids : iterable of hashable or NetworkPatch
+            The region ``tids``. A
+            :class:`~quimb.tensor.networking.NetworkPatch` also selects the
+            subset of inner excited bonds. Non-excited inner bonds are treated
+            like boundary bonds. See
+            :func:`~quimb.tensor.networking.gen_gloops_edge_induced`.
         partial_trace_map : dict[str, str], optional
-            A remapping of ket indices to bra indices to perform an effective
-            partial trace.
+            Map ket indices to bra indices for an effective partial trace.
         exclude : iterable of str, optional
-            A set of bond indices to exclude from inserting excitation
-            projectors on, e.g. when forming a reduced density matrix.
+            Bond indices that do not receive excitation projectors, e.g. when
+            forming a reduced density matrix.
 
         Returns
         -------
         TensorNetwork
         """
+        if isinstance(tids, NetworkPatch):
+            excited = tids.inds
+            tids = tids.tids
+        else:
+            # excite every inner bond
+            excited = None
+
         stn = self.tn._select_tids(tids)
 
         kixmaps = {tid: {} for tid in stn.tensor_map}
@@ -730,7 +741,13 @@ class D2BP(BeliefPropagationCommon):
                     bixmaps[tid][ix] = bix
                     # store labels for excitation projector, (bra, ket)
                     exc_ixs.setdefault(ix, {})[tid] = (bix, kix)
-                ems.append((ix, ix_tids))
+
+                if (excited is None) or (ix in excited):
+                    ems.append((ix, ix_tids))
+                else:
+                    # messages cut this bond like a boundary bond
+                    for tid in ix_tids:
+                        bms.append((ix, tid))
 
             else:
                 # boundary index
@@ -756,7 +773,7 @@ class D2BP(BeliefPropagationCommon):
             inds = (bixmaps[tid][ix], kixmaps[tid][ix])
             tn |= qtn.Tensor(data, inds)
 
-        # add inner exitation projector message tensors
+        # add inner excitation projectors
         with ar.backend_like(self.backend):
             for ix, ix_tids in ems:
                 tidl, tidr = ix_tids
@@ -794,10 +811,10 @@ class D2BP(BeliefPropagationCommon):
 
         Parameters
         ----------
-        gloops : None, int, "min" or iterable of tuples, optional
-            The generalized loops to use, an integer to generate all loops up
-            to that size, or ``None``/``"min"`` for the automatic size, see
-            :func:`~quimb.tensor.networking.gen_gloops`.
+        gloops : None, int, "min" or iterable, optional
+            Loops or regions to use. An integer generates all loops up to that
+            size. ``None`` and ``"min"`` use an automatic size. An iterable
+            can contain regions of ``tids`` or ``NetworkPatch`` objects.
         multi_excitation_correct : bool, optional
             Whether to use the multi-excitation correction. If ``True``, then
             the free energy is refined iteratively until self consistent.
@@ -818,20 +835,19 @@ class D2BP(BeliefPropagationCommon):
         # accrues BP estimate into self.sign and self.exponent
         self.normalize_tensors()
 
-        gloops = _parse_global_gloops(self.tn, gloops)
+        gloops = parse_gloops_edge_induced(self.tn, gloops)
 
         weights = {}
         for gloop in gloops:
-            # get local tensor network with boundary
-            # messages and excitation projectors inserted
             etn = self.get_cluster_excited(gloop)
-            # contract it to get local weight!
-            weights[tuple(gloop)] = etn.contract(
-                optimize=optimize, **contract_opts
-            )
+            w = etn.contract(optimize=optimize, **contract_opts)
+            # loops with the same tensor support use one suppression factor
+            key = tuple(sorted(gloop.tids))
+            weights[key] = weights.get(key, 0.0) + w
 
         return process_loop_series_expansion_weights(
             weights,
+            num_tensors=self.tn.num_tensors,
             mantissa=self.sign,
             exponent=self.exponent,
             multi_excitation_correct=multi_excitation_correct,
@@ -845,10 +861,11 @@ class D2BP(BeliefPropagationCommon):
         where,
         gloops=None,
         normalized=True,
-        grow_from="alldangle",
+        grow_from="all",
         strict_size=False,
         multi_excitation_correct=True,
         optimize="auto-hq",
+        allow_dangling=True,
         **contract_opts,
     ):
         """Compute the reduced density matrix for the sites specified by
@@ -866,17 +883,16 @@ class D2BP(BeliefPropagationCommon):
             :func:`~quimb.tensor.networking.gen_gloops`.
         normalized : bool, optional
             Whether to normalize the final density matrix.
-        grow_from : {'alldangle', 'all', 'any'}, optional
+        grow_from : {'all', 'any'}, optional
             How to grow the generalized loops from the specified ``where``:
 
-            - 'alldangle': clusters up to max size, where target sites are
-              allowed to dangle.
-            - 'all': clusters where loop, up to max size, has to include *all*
-              target sites.
-            - 'any': clusters where loop, up to max size, can include *any* of
-              the target sites. Remaining target sites are added as extras.
+            - 'all': the loop, up to max size, must include *all* target sites.
+            - 'any': the loop, up to max size, can include *any* of the target
+              sites. The other target sites are added as extras.
 
-            By default 'alldangle'.
+        allow_dangling : bool, optional
+            Whether target sites can have fewer than two internal bonds in
+            yielded regions.
         strict_size : bool, optional
             Whether to enforce the maximum size of the generalized loops, only
             relevant for `grow_from="any"`.
@@ -906,6 +922,7 @@ class D2BP(BeliefPropagationCommon):
             gloops=gloops,
             grow_from=grow_from,
             strict_size=strict_size,
+            allow_dangling=allow_dangling,
         )
         # the base (BP) region, including target sites only
         r0 = frozenset(tids)
@@ -940,7 +957,9 @@ class D2BP(BeliefPropagationCommon):
             weights.pop(r0)
             # compute exponential suppresion factors
             corrections = process_loop_series_expansion_weights(
-                weights, return_all=True
+                weights,
+                num_tensors=self.tn.num_tensors,
+                return_all=True,
             )
             # add back in the BP contribution
             corrections[r0] = 1.0
@@ -1065,6 +1084,8 @@ class D2BP(BeliefPropagationCommon):
         """
         tn = self.tn if inplace else self.tn.copy()
 
+        fermionic = tn.isfermionic()
+
         reduce_opts = ensure_dict(reduce_opts)
         compress_opts = kwargs | ensure_dict(compress_opts)
         compress_opts.setdefault("max_bond", max_bond)
@@ -1093,7 +1114,12 @@ class D2BP(BeliefPropagationCommon):
 
             tb = tn.tensor_map[tidb]
             dim_right = tb.size // dim_bond
-            mr_raw = self.messages[ix, tida].T
+            mr_raw = self.messages[ix, tida]
+            if fermionic:
+                # transpose without fermionic phases to match matrix axis order
+                mr_raw = mr_raw.transpose(phase=False)
+            else:
+                mr_raw = ar.do("transpose", mr_raw)
             mr = mr_raw if conditioner is None else conditioner(mr_raw)
             Rb = qtn.decomp.squared_op_to_reduced_factor(
                 mr, dim_bond, dim_right, right=False, **reduce_opts
@@ -1119,9 +1145,20 @@ class D2BP(BeliefPropagationCommon):
                         mr_raw, dim_bond, dim_right, right=False, **reduce_opts
                     )
                 new_Ra = Ra @ Pa
+                if fermionic:
+                    new_ml = new_Ra.dagger_compose_left() @ new_Ra
+                else:
+                    new_ml = ar.dag(new_Ra) @ new_Ra
+                self.messages[ix, tidb] = new_ml
+
                 new_Rb = Pb @ Rb
-                self.messages[ix, tidb] = ar.dag(new_Ra) @ new_Ra
-                self.messages[ix, tida] = new_Rb @ ar.dag(new_Rb)
+                if fermionic:
+                    new_mr = new_Rb @ new_Rb.dagger_compose_right()
+                    new_mr = new_mr.transpose(phase=False)
+                else:
+                    new_mr = ar.do("transpose", new_Rb @ ar.dag(new_Rb))
+                self.messages[ix, tida] = new_mr
+
                 self._messages_conditioned.pop((ix, tidb), None)
                 self._messages_conditioned.pop((ix, tida), None)
 
@@ -1434,9 +1471,10 @@ class D2BP(BeliefPropagationCommon):
         gloops=None,
         combine="sum",
         normalized=True,
-        grow_from="alldangle",
+        grow_from="all",
         strict_size=False,
         optimize="auto-hq",
+        allow_dangling=True,
         **contract_opts,
     ):
         """Compute a reduced density matrix for the sites specified by
@@ -1459,17 +1497,16 @@ class D2BP(BeliefPropagationCommon):
             normalize each cluster density matrix by its trace. If "separate",
             normalize the final density matrix by its trace (usually less
             accurate). If False, do not normalize.
-        grow_from : {'alldangle', 'all', 'any'}, optional
+        grow_from : {'all', 'any'}, optional
             How to grow the generalized loops from the specified ``where``:
 
-            - 'alldangle': clusters up to max size, where target sites are
-              allowed to dangle.
-            - 'all': clusters where loop, up to max size, has to include *all*
-              target sites.
-            - 'any': clusters where loop, up to max size, can include *any* of
-              the target sites. Remaining target sites are added as extras.
+            - 'all': the loop, up to max size, must include *all* target sites.
+            - 'any': the loop, up to max size, can include *any* of the target
+              sites. The other target sites are added as extras.
 
-            By default 'alldangle'.
+        allow_dangling : bool, optional
+            Whether target sites can have fewer than two internal bonds in
+            yielded regions.
         strict_size : bool, optional
             Whether to enforce the maximum size of the generalized loops, only
             relevant for `grow_from="any"`.
@@ -1489,6 +1526,7 @@ class D2BP(BeliefPropagationCommon):
             gloops=gloops,
             grow_from=grow_from,
             strict_size=strict_size,
+            allow_dangling=allow_dangling,
         )
 
         rhos = []

@@ -37,8 +37,8 @@ def array_split(
     method="auto",
     absorb="auto",
     max_bond=None,
-    cutoff=1e-10,
-    cutoff_mode="rsum2",
+    cutoff="auto",
+    cutoff_mode="rel",
     renorm=None,
     info=None,
     **kwargs,
@@ -66,8 +66,8 @@ def array_split(
         - ``'svd:eig'``: full SVD via eigendecomposition, allowing all
           truncation options. This can be faster than the standard SVD, but
           entails some loss of precision.
-        - ``'svd:rand'``: low-rank SVD via randomized projection, allows
-          (and is only beneficial for) static truncation
+        - ``'svd:rand'``: low-rank SVD via randomized projection, allowing
+          static and non-cumulative dynamic truncation.
         - ``'qr'``: QR decomposition, by default left factor is isometric.
         - ``'qr:cholesky'``: QR decomposition via Cholesky factorization, by
           default left factor is isometric. This can be faster than the
@@ -119,25 +119,29 @@ def array_split(
     max_bond : int or None, optional
         The maximum bond dimension (number of singular values) to keep.
         ``None`` means no limit.
-    cutoff : float, optional
+    cutoff : float or "auto", optional
         Threshold for discarding singular values, only used by methods that
-        support dynamic truncation.
-    cutoff_mode : {'rsum2', 'rel', 'abs', 'sum2', 'rsum1', 'sum1'}, optional
+        support dynamic truncation. With ``"auto"``, use ``1e-10`` for exact
+        rank-revealing methods and no cutoff for randomized SVD.
+    cutoff_mode : {"rel", "rsum2", "rsum1", "abs", "sum2", "sum1"}, optional
         How to interpret ``cutoff`` when discarding singular values:
 
         - ``'rel'``: values less than ``cutoff * s[0]`` discarded.
-        - ``'abs'``: values less than ``cutoff`` discarded.
-        - ``'sum2'``: sum squared of values discarded must be ``< cutoff``.
         - ``'rsum2'``: sum squared of values discarded must be less than
           ``cutoff`` times the total sum of squared values.
-        - ``'sum1'``: sum values discarded must be ``< cutoff``.
         - ``'rsum1'``: sum of values discarded must be less than ``cutoff``
           times the total sum of values.
+        - ``'abs'``: values less than ``cutoff`` discarded.
+        - ``'sum2'``: sum squared of values discarded must be ``< cutoff``.
+        - ``'sum1'``: sum values discarded must be ``< cutoff``.
 
+        For batched arrays, ``'abs'`` and ``'rel'`` use one threshold and
+        retain the smallest common bond dimension that keeps every required
+        singular value. Cumulative modes are not supported for batched arrays.
     renorm : int or bool, optional
         Whether to renormalize the kept singular values to maintain the
         Frobenius or nuclear norm. ``0`` or ``False`` means no renormalization.
-        ``True`` automatically picks the power based on ``cutoff_mode``.
+        ``True`` uses power 1 for ``sum1``/``rsum1`` and power 2 otherwise.
     info : dict or None, optional
         If a dict is passed, store truncation info in the dict. Currently only
         supports the key 'error' for the truncation error, which is only
@@ -365,27 +369,33 @@ def parse_method_absorb(
     return method, absorb
 
 
-@functools.cache
+# typed to distinguish e.g. between 1 / True
+@functools.lru_cache(maxsize=None, typed=True)
 def parse_split_opts(
     method="auto",
     absorb="auto",
     max_bond=None,
-    cutoff=1e-10,
-    cutoff_mode="rsum2",
+    cutoff="auto",
+    cutoff_mode="rel",
     renorm=None,
 ):
     """Automatically select method and absorb, convert defaults and settings to
     numeric type for numba, and only supply valid options for given method.
     """
-    # first normalize main truncation opts
+    # normalize None to the numeric sentinels the low level functions expect
     max_bond = _MAX_BOND_LOOKUP.get(max_bond, max_bond)
     cutoff = _CUTOFF_LOOKUP.get(cutoff, cutoff)
 
-    # note: default options are truncating
-    truncation = (max_bond > 0) or (cutoff > 0.0)
+    # note: default options are truncating, we treat "auto" as truncating since
+    # if method resolves to a non-truncating method, cutoff will be ignored
+    truncation = (cutoff == "auto") or (max_bond > 0) or (cutoff > 0.0)
 
-    # first we resolve the the possibly automatically chosen method and absorb
+    # resolve the possibly automatically chosen method and absorb
     method, absorb = parse_method_absorb(method, absorb, truncation=truncation)
+
+    if cutoff == "auto":
+        # svd:rand truncates via max_bond, the rest need an explicit cutoff
+        cutoff = 0.0 if method == "svd:rand" else 1e-10
 
     # finally we check which options to inject based on method capabilities
     signature = inspect.signature(_SPLIT_FNS[method])
@@ -415,7 +425,7 @@ def parse_split_opts(
             if "renorm" in signature.parameters:
                 if renorm is True:
                     # match renorm power to cutoff mode
-                    renorm = _RENORM_LOOKUP.get(cutoff_mode, 0)
+                    renorm = _RENORM_LOOKUP.get(cutoff_mode, 2)
                     opts["renorm"] = renorm
                 else:
                     # turn off, or use explicitly supplied power
@@ -751,22 +761,32 @@ def _trim_and_renorm_svd_result(
 
     *batch_dims, d = xp.shape(sabs)
 
+    cumulative_modes = (
+        cutoff_mode_sum2,
+        cutoff_mode_rsum2,
+        cutoff_mode_sum1,
+        cutoff_mode_rsum1,
+    )
+    if batch_dims and (cutoff > 0.0) and (cutoff_mode in cumulative_modes):
+        raise ValueError(
+            "Cumulative cutoff modes are not supported for batched "
+            "decompositions. Use cutoff_mode='abs' or 'rel'."
+        )
+
     if (cutoff > 0.0) or (renorm > 0):
         # need to dynamically truncate based on spectrum
         if cutoff_mode == cutoff_mode_abs:
             n_chi = xp.count_nonzero(sabs > cutoff, axis=-1)
 
         elif cutoff_mode == cutoff_mode_rel:
-            n_chi = xp.count_nonzero(sabs > cutoff * sabs[..., 0:1], axis=-1)
+            # keep the leading-value axis for torch vectorization
+            smax = sabs[..., 0:1]
+            if batch_dims:
+                # treat the batch as a single spectrum spread across blocks
+                smax = xp.max(smax)
+            n_chi = xp.count_nonzero(sabs > cutoff * smax, axis=-1)
 
-        elif cutoff_mode in (
-            cutoff_mode_sum2,
-            cutoff_mode_rsum2,
-            cutoff_mode_sum1,
-            cutoff_mode_rsum1,
-        ):
-            # TODO: if we are truncating a batch result, we might want to treat
-            # all singular values together, assuming block diagonal form
+        elif cutoff_mode in cumulative_modes:
             if cutoff_mode in (cutoff_mode_sum2, cutoff_mode_rsum2):
                 pow = 2
                 sp = sabs**pow
@@ -807,7 +827,16 @@ def _trim_and_renorm_svd_result(
         VH = VH[..., :n_chi, :]
 
         if renorm > 0:
-            norm = (tot / csp[n_chi - 1]) ** (1 / pow)
+            # norm preservation is independent of the truncation criterion
+            if cutoff_mode in cumulative_modes and renorm == pow:
+                total = tot
+                kept = csp[..., n_chi - 1 : n_chi]
+            else:
+                weights = sabs**renorm
+                total = xp.sum(weights, axis=-1, keepdims=True)
+                kept = xp.sum(weights[..., :n_chi], axis=-1, keepdims=True)
+            norm = (total / xp.where(kept > 0, kept, 1)) ** (1 / renorm)
+            norm = xp.where(kept > 0, norm, 1)
             s *= norm
 
         if "error" in info:
@@ -831,7 +860,7 @@ def _trim_and_renorm_svd_result(
 def svd_truncated(
     x,
     cutoff=-1.0,
-    cutoff_mode=cutoff_mode_rsum2,
+    cutoff_mode=cutoff_mode_rel,
     max_bond=-1,
     absorb=get_Usq_sqVH,
     renorm=0,
@@ -843,6 +872,8 @@ def svd_truncated(
 
     Parameters
     ----------
+    x : array_like
+        The 2D array or batch of 2D arrays to decompose.
     cutoff : float, optional
         Singular value cutoff threshold, if ``cutoff <= 0.0``, then only
         ``max_bond`` is used.
@@ -1033,7 +1064,7 @@ def _trim_and_renorm_svd_result_numba(
 def svd_truncated_numba(
     x,
     cutoff=-1.0,
-    cutoff_mode=cutoff_mode_rsum2,
+    cutoff_mode=cutoff_mode_rel,
     max_bond=-1,
     absorb=get_Usq_sqVH,
     renorm=0,
@@ -1059,7 +1090,7 @@ def svd_truncated_numba(
 def svd_truncated_numpy(
     x,
     cutoff=-1.0,
-    cutoff_mode=cutoff_mode_rsum2,
+    cutoff_mode=cutoff_mode_rel,
     max_bond=-1,
     absorb=get_Usq_sqVH,
     renorm=0,
@@ -1123,7 +1154,7 @@ def svd_truncated_numpy(
 def svd_truncated_lazy(
     x,
     cutoff=-1.0,
-    cutoff_mode=cutoff_mode_rsum2,
+    cutoff_mode=cutoff_mode_rel,
     max_bond=-1,
     absorb=get_Usq_sqVH,
     renorm=0,
@@ -1180,7 +1211,7 @@ def svd_via_eig(
     Parameters
     ----------
     x : array-like
-        The 2d array to decompose.
+        The 2D array or batch of 2D arrays to decompose.
     absorb : str or None, optional
         What to compute / where to absorb the singular values:
 
@@ -1366,7 +1397,7 @@ def svd_via_eig(
 def svd_via_eig_truncated(
     x,
     cutoff=-1.0,
-    cutoff_mode=cutoff_mode_rsum2,
+    cutoff_mode=cutoff_mode_rel,
     max_bond=-1,
     absorb=get_Usq_sqVH,
     renorm=0,
@@ -1378,6 +1409,8 @@ def svd_via_eig_truncated(
 
     Parameters
     ----------
+    x : array-like
+        The 2D array or batch of 2D arrays to decompose.
     cutoff : float, optional
         Singular value cutoff threshold, if ``cutoff <= 0.0``, then only
         ``max_bond`` is used.
@@ -1499,7 +1532,7 @@ def _svd_via_eig_numba(
         if descending:
             s2 = s2[::-1]
             V = np.ascontiguousarray(V[:, ::-1])
-        s2 = np.maximum(s2, 0.0)
+        s2 = np.maximum(s2, np.zeros_like(s2))
         if absorb == get_s:  # 'svals'
             return None, np.sqrt(s2), None
         if absorb == get_VH:  # 'rorthog'
@@ -1543,8 +1576,7 @@ def _svd_via_eig_numba(
         if descending:
             s2 = s2[::-1]
             U = np.ascontiguousarray(U[:, ::-1])
-        # clip small/negative eigenvalues
-        s2 = np.maximum(s2, 0.0)
+        s2 = np.maximum(s2, np.zeros_like(s2))
         if absorb == get_s:  # 'svals'
             return None, np.sqrt(s2), None
         if absorb == get_U:  # 'lorthog'
@@ -1586,7 +1618,7 @@ def _svd_via_eig_numba(
 def _svd_via_eig_truncated_numba(
     x,
     cutoff=-1.0,
-    cutoff_mode=cutoff_mode_rsum2,
+    cutoff_mode=cutoff_mode_rel,
     max_bond=-1,
     absorb=get_Usq_sqVH,
     renorm=0,
@@ -1633,7 +1665,7 @@ def _svd_via_eig_truncated_numba(
 def svd_via_eig_truncated_numpy(
     x,
     cutoff=-1.0,
-    cutoff_mode=cutoff_mode_rsum2,
+    cutoff_mode=cutoff_mode_rel,
     max_bond=-1,
     absorb=get_Usq_sqVH,
     renorm=0,
@@ -1691,6 +1723,8 @@ def svdvals_eig(x):
 def svd_rand_truncated(
     x,
     max_bond,
+    cutoff=0.0,
+    cutoff_mode=cutoff_mode_rel,
     absorb=get_Usq_sqVH,
     oversample=10,
     num_iterations=2,
@@ -1700,20 +1734,28 @@ def svd_rand_truncated(
     lorthog_opts=None,
     reduced_opts=None,
     seed=None,
+    noise_dist="normal",
 ):
     """Singular value decomposition of raw 2d array ``x``, via randomized
-    sketching, with static truncation (``max_bond`` only) and various
-    ``absorb`` return options, each with their own shortcuts. The speedup
-    over full SVD is proportional to the truncation.
+    sketching, with static truncation via ``max_bond`` and optional dynamic
+    truncation via a non-cumulative ``cutoff``. The speedup over full SVD is
+    proportional to the truncation.
 
     Parameters
     ----------
     x : array_like
-        The 2d array to decompose.
+        The 2D array or batch of 2D arrays to decompose.
     max_bond : int
         An explicit maximum bond dimension / target rank for the randomized
         sketch. You can use ``None`` or a negative value to indicate no
         truncation, though this is not recommended as there is no speedup.
+    cutoff : float, optional
+        Absolute or relative threshold for discarding singular values from
+        the sketched spectrum. Disabled by default.
+    cutoff_mode : {1, 2, "abs", "rel"}, optional
+        How to interpret ``cutoff``. ``"abs"`` discards values below
+        ``cutoff`` and ``"rel"`` discards values below ``cutoff * s[0]``.
+        Cumulative modes which require full spectrum are not supported.
     absorb : str or None, optional
         What to compute / where to absorb the singular values:
 
@@ -1755,6 +1797,8 @@ def svd_rand_truncated(
         matrix.
     seed : int, Generator or None, optional
         Random seed or existing generator for reproducibility.
+    noise_dist : {"normal", "rademacher"}, optional
+        The distribution to use when generating the random sketch.
 
     Returns
     -------
@@ -1766,8 +1810,35 @@ def svd_rand_truncated(
     if max_bond is None:
         max_bond = -1
 
+    # options for the orthonormalization of the random sketch
     lorthog_opts = ensure_dict(lorthog_opts)
     lorthog_opts.setdefault("method", method_lorthog)
+    lorthog_opts.setdefault("cutoff", 0.0)
+
+    # options for the possible reduced core SVD
+    reduced_opts = ensure_dict(reduced_opts)
+    reduced_opts.setdefault("method", method_reduced)
+    reduced_opts.setdefault("cutoff", cutoff)
+    reduced_opts.setdefault("cutoff_mode", cutoff_mode)
+    cutoff = reduced_opts["cutoff"]
+    if cutoff == "auto":
+        cutoff = 1e-10
+    else:
+        cutoff = _CUTOFF_LOOKUP.get(cutoff, cutoff)
+    cutoff_mode = _CUTOFF_MODE_MAP[reduced_opts["cutoff_mode"]]
+    reduced_opts.update(cutoff=cutoff, cutoff_mode=cutoff_mode)
+
+    if (cutoff > 0.0) and cutoff_mode not in (
+        cutoff_mode_abs,
+        cutoff_mode_rel,
+    ):
+        raise ValueError(
+            "Cumulative cutoff modes are not supported by "
+            "svd_rand_truncated. Use cutoff_mode='abs' or 'rel'."
+        )
+
+    # various shortcuts are only possible with static truncation
+    dynamic_cutoff = cutoff > 0.0
 
     xp = get_namespace(x)
     *batch_dims, m, n = xp.shape(x)
@@ -1793,11 +1864,11 @@ def svd_rand_truncated(
             # note unlike svd via eig, tall vs wide is secondary consideration
             right = m > n
 
-    rng = xp.random.default_rng(seed)
-
     if right:
         # tall: sketch from the right
-        omega = rng.normal(size=(*batch_dims, n, k_sketch))
+        omega = xp.random.array(
+            (*batch_dims, n, k_sketch), dist=noise_dist, rng=seed
+        )
         y = x @ omega
         if num_iterations:
             xdag = xp.conj(xp.swapaxes(x, -2, -1))
@@ -1809,7 +1880,7 @@ def svd_rand_truncated(
         Q, _, _ = array_split(y, absorb=get_U, **lorthog_opts)
 
         # X ≈ Q @ B, maybe shortcut for some absorb if no truncation needed
-        if k >= k_sketch:
+        if (not dynamic_cutoff) and (k >= k_sketch):
             if absorb == get_U_sVH:  # 'right'
                 return Q, None, xp.conj(xp.swapaxes(Q, -2, -1)) @ x
             if absorb == get_sVH:  # 'rfactor'
@@ -1821,7 +1892,9 @@ def svd_rand_truncated(
         B = xp.conj(xp.swapaxes(Q, -2, -1)) @ x
     else:
         # wide: sketch from the left
-        omega = rng.normal(size=(*batch_dims, k_sketch, m))
+        omega = xp.random.array(
+            (*batch_dims, k_sketch, m), dist=noise_dist, rng=seed
+        )
         y = omega @ x
         if num_iterations:
             xdag = xp.conj(xp.swapaxes(x, -2, -1))
@@ -1834,7 +1907,7 @@ def svd_rand_truncated(
         Q, _, _ = array_split(y, absorb=get_U, **lorthog_opts)
 
         # X ≈ B @ Qdag, maybe shortcut for some absorb if no truncation needed
-        if k >= k_sketch:
+        if (not dynamic_cutoff) and (k >= k_sketch):
             if absorb == get_Us_VH:  # 'left'
                 return x @ Q, None, xp.conj(xp.swapaxes(Q, -2, -1))
             if absorb == get_Us:  # 'lfactor'
@@ -1844,10 +1917,6 @@ def svd_rand_truncated(
 
         # form reduced factor
         B = x @ Q
-
-    reduced_opts = ensure_dict(reduced_opts)
-    reduced_opts.setdefault("method", method_reduced)
-    reduced_opts.setdefault("cutoff", 0.0)
 
     # decompose and maybe further truncate reduced matrix
     U, s, VH = array_split(B, absorb=absorb, max_bond=k, **reduced_opts)
@@ -1901,7 +1970,7 @@ def _with_diag_shift_numba(x, shift=0.0):
 def eigh_truncated(
     x,
     cutoff=-1.0,
-    cutoff_mode=cutoff_mode_rsum2,
+    cutoff_mode=cutoff_mode_rel,
     max_bond=-1,
     absorb=get_Usq_sqVH,
     renorm=0,
@@ -1913,6 +1982,35 @@ def eigh_truncated(
 
     Parameters
     ----------
+    x : array_like
+        The 2D array or batch of 2D arrays to decompose.
+    cutoff : float, optional
+        Singular value cutoff threshold, if ``cutoff <= 0.0``, then only
+        ``max_bond`` is used.
+    cutoff_mode : {1, 2, 3, 4, 5, 6}, optional
+        How to perform the truncation based on ``cutoff``:
+
+        - 1 / 'abs': trim values below ``cutoff``
+        - 2 / 'rel': trim values below ``s[0] * cutoff``
+        - 3 / 'sum2': trim s.t. ``sum(s_trim**2) < cutoff``.
+        - 4 / 'rsum2': trim s.t. ``sum(s_trim**2) < sum(s**2) * cutoff``.
+        - 5 / 'sum1': trim s.t. ``sum(s_trim**1) < cutoff``.
+        - 6 / 'rsum1': trim s.t. ``sum(s_trim**1) < sum(s**1) * cutoff``.
+
+    max_bond : int, optional
+        An explicit maximum bond dimension, use -1 for none.
+    absorb : int or None, optional
+        How to absorb the singular values, as a pre-converted numeric code
+        (``get_Us_VH=-1``: left, ``get_Usq_sqVH=0``: both,
+        ``get_U_sVH=1``: right, ``None``: return separately). Use
+        ``array_split`` with string aliases (e.g. ``'left'``, ``'both'``,
+        ``'right'``, ``None``) for a friendlier interface.
+    renorm : int, optional
+        Whether to renormalize the kept singular values. ``0`` means
+        no renormalization, ``1`` maintains the trace norm, ``2``
+        maintains the Frobenius norm.
+    positive : bool, optional
+        Whether to assume the operator is positive semi-definite.
     shift : bool or float, optional
         Whether to add a small shift to the diagonal of ``x`` for
         regularization. The valid options are:
@@ -1973,7 +2071,7 @@ def eigh_truncated(
 def eigh_truncated_numba(
     x,
     cutoff=-1.0,
-    cutoff_mode=cutoff_mode_rsum2,
+    cutoff_mode=cutoff_mode_rel,
     max_bond=-1,
     absorb=get_Usq_sqVH,
     renorm=0,
@@ -2024,7 +2122,7 @@ def eigh_truncated_numba(
 def eigh_truncated_numpy(
     x,
     cutoff=-1.0,
-    cutoff_mode=cutoff_mode_rsum2,
+    cutoff_mode=cutoff_mode_rel,
     max_bond=-1,
     absorb=get_Usq_sqVH,
     renorm=0,
@@ -2060,7 +2158,7 @@ def qr_stabilized(x, absorb=get_U_sVH, stabilized=True, **kwargs):
     Parameters
     ----------
     x : array_like
-        The 2d array to decompose.
+        The 2D array or batch of 2D arrays to decompose.
     absorb : str or int, optional
         What form to compute / where to 'absorb' the singular values:
 
@@ -2276,7 +2374,7 @@ def cholesky_regularized(x, absorb=get_Usq_sqVH, shift=True):
     Parameters
     ----------
     x : array_like
-        The 2D array to decompose.
+        The 2D array or batch of 2D arrays to decompose.
     absorb : int, optional
         How to absorb the factors. The valid options are:
 
@@ -2311,7 +2409,7 @@ def cholesky_regularized(x, absorb=get_Usq_sqVH, shift=True):
         try:
             # try without shift
             return _cholesky_maybe_with_diag_shift(x, absorb, shift=0.0)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             warnings.warn(
                 f"Cholesky decomposition failed with error: {e}. "
                 "retrying with small regularization added to the diagonal."
@@ -2346,7 +2444,7 @@ def cholesky_regularized_numpy(x, absorb=get_Usq_sqVH, shift=True):
         try:
             # try without shift
             return _cholesky_regularized_numba(x, absorb, shift=0.0)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             warnings.warn(
                 f"Cholesky decomposition failed with error: {e}. "
                 "retrying with small regularization added to the diagonal."
@@ -2446,7 +2544,7 @@ def _choose_k(x, cutoff, max_bond):
 def svds(
     x,
     cutoff=0.0,
-    cutoff_mode=cutoff_mode_rsum2,
+    cutoff_mode=cutoff_mode_rel,
     max_bond=-1,
     absorb=get_Usq_sqVH,
     renorm=0,
@@ -2480,7 +2578,7 @@ def svds(
 def isvd(
     x,
     cutoff=0.0,
-    cutoff_mode=cutoff_mode_rsum2,
+    cutoff_mode=cutoff_mode_rel,
     max_bond=-1,
     absorb=get_Usq_sqVH,
     renorm=0,
@@ -2514,7 +2612,7 @@ def isvd(
 def _rsvd_numpy(
     x,
     cutoff=0.0,
-    cutoff_mode=cutoff_mode_rsum2,
+    cutoff_mode=cutoff_mode_rel,
     max_bond=-1,
     absorb=get_Usq_sqVH,
     renorm=0,
@@ -2538,7 +2636,7 @@ def _rsvd_numpy(
 def rsvd(
     x,
     cutoff=0.0,
-    cutoff_mode=cutoff_mode_rsum2,
+    cutoff_mode=cutoff_mode_rel,
     max_bond=-1,
     absorb=get_Usq_sqVH,
     renorm=0,
@@ -2576,7 +2674,7 @@ def rsvd(
 def eigsh(
     x,
     cutoff=0.0,
-    cutoff_mode=cutoff_mode_rsum2,
+    cutoff_mode=cutoff_mode_rel,
     max_bond=-1,
     absorb=get_Usq_sqVH,
     renorm=0,
@@ -2617,7 +2715,7 @@ def eigsh(
 def lu_truncated(
     x,
     cutoff=-1.0,
-    cutoff_mode=cutoff_mode_rsum2,
+    cutoff_mode=cutoff_mode_rel,
     max_bond=-1,
     absorb=get_Usq_sqVH,
     renorm=0,
@@ -3192,7 +3290,7 @@ def compute_oblique_projectors(
 
     .. math::
 
-        A' = Q_L P_L P_R' Q_R
+        A' = Q_L R_L P_L P_R R_R Q_R
 
     Parameters
     ----------

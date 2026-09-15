@@ -1,3 +1,5 @@
+import importlib.util
+
 import numpy as np
 import pytest
 from numpy.testing import assert_allclose
@@ -141,6 +143,24 @@ def test_loop_series_expansion_order0_matches_partial_trace(dtype):
     assert_allclose(rho_ls4, rho_ls4.conj().T, atol=1e-10)
 
 
+@pytest.mark.parametrize(
+    "method",
+    ["partial_trace_loop_series_expansion", "partial_trace_gloop_expand"],
+)
+def test_partial_trace_gloop_tree_returns_base(method):
+    tn = qtn.TN_from_edges_rand(
+        [(0, 1), (1, 2), (2, 3)], D=2, phys_dim=2, seed=42
+    )
+    bp = qbp.D2BP(tn)
+    bp.run(tol=1e-12)
+    with pytest.warns(UserWarning, match="only the target region"):
+        rho = getattr(bp, method)([1])
+    assert rho.shape == (2, 2)
+    assert_allclose(np.trace(rho), 1.0)
+    # on a tree bp is exact, so the fallback must give the base region rdm
+    assert_allclose(rho, bp.partial_trace([1], get="matrix"))
+
+
 @pytest.mark.parametrize("dtype", ["float64", "complex128"])
 def test_loop_series_expansion_repeatable(dtype):
     # see gh-381
@@ -160,6 +180,20 @@ def test_loop_series_expansion_repeatable(dtype):
     r3 = loop_rdm()
     assert_allclose(r1, r2, atol=1e-12)
     assert_allclose(r1, r3, atol=1e-12)
+
+
+def test_loop_series_expansion_converges_to_exact():
+    # every pair of loops shares a site, so the connected series is exact
+    peps = qtn.PEPS.rand(3, 3, bond_dim=2, seed=42, dist="uniform", loc=0.5)
+    zex = (peps.H | peps).contract(output_inds=())
+
+    bp = qbp.D2BP(peps)
+    bp.run(tol=1e-13)
+    z = bp.contract_loop_series_expansion(
+        gloops=9,
+        multi_excitation_correct=False,
+    )
+    assert z == pytest.approx(zex, rel=1e-12)
 
 
 @pytest.mark.parametrize("seed", range(2))
@@ -317,6 +351,20 @@ class TestConditionedMessageStore:
         for key, m in bp.messages.items():
             m = m / np.linalg.norm(m)
             assert m == pytest.approx(old[key], abs=1e-10)
+
+    @pytest.mark.parametrize("max_bond", [2, 64])
+    @pytest.mark.parametrize("dtype", ["float64", "complex128"])
+    def test_compress_writes_back_positive_messages(self, dtype, max_bond):
+        # check the transpose and conjugation used by inplace writeback
+        peps = qtn.PEPS.rand(3, 3, 2, seed=42, dtype=dtype)
+        bp = qbp.D2BP(peps)
+        bp.run(max_iterations=1000, tol=1e-13)
+        bp.compress(max_bond=max_bond, cutoff=0.0, inplace=True)
+
+        for m in bp.messages.values():
+            m = m / np.linalg.norm(m)
+            assert_allclose(m, m.conj().T, atol=1e-12)
+            assert np.linalg.eigvalsh(m).min() > -1e-12
 
 
 def test_gauge_insert_conditioning_and_inverse():
@@ -542,3 +590,128 @@ def test_gauge_all_belief_propagation(inplace):
             messages[ix, tidb],
             abs=1e-10,
         )
+
+
+requires_symmray = pytest.mark.skipif(
+    importlib.util.find_spec("symmray") is None,
+    reason="symmray not installed",
+)
+
+
+@requires_symmray
+@pytest.mark.parametrize("fermionic", [False, True])
+@pytest.mark.parametrize("odd", [False, True])
+@pytest.mark.parametrize("reverse", [False, True])
+class TestSymmetricMessages:
+    """Check compression across parity and bond orientation."""
+
+    @pytest.fixture(autouse=True)
+    def _known_bad(self, request, fermionic, odd, reverse):
+        # reversed fermionic bonds produce non-PSD messages
+        if not (fermionic and reverse):
+            return
+        # message reuse fails at both parities
+        # contraction fails only when the tensor parity is odd
+        reads_messages = any(
+            name in request.node.name
+            for name in ("positive_messages", "compress_twice")
+        )
+        if odd or reads_messages:
+            request.applymarker(
+                pytest.mark.xfail(
+                    reason="reversed bond dualness signs fermionic messages",
+                    strict=True,
+                )
+            )
+
+    @staticmethod
+    def _scalar_tn(fermionic, odd, reverse, dtype="float64", seed=42):
+        """Build a scalar network with optional reversed bond dualness."""
+        import symmray as sr
+
+        if odd:
+            # odd sites on the diagonal, keeping the total charge even
+            def site_charge(site):
+                return int(site[0] == site[1])
+
+        else:
+
+            def site_charge(site):
+                return 0
+
+        tn = sr.TN_abelian_from_edges_rand(
+            symmetry="Z2",
+            edges=qtn.edges_2d_square(4, 4),
+            bond_dim=2,
+            phys_dim=None,
+            fermionic=fermionic,
+            site_charge=site_charge,
+            dtype=dtype,
+            seed=seed,
+        )
+        if reverse:
+            tn = qtn.TensorNetwork(list(tn.tensors)[::-1])
+        return tn
+
+    def test_compress_full_rank_is_exact(self, fermionic, odd, reverse):
+        if odd and not fermionic:
+            pytest.skip("charge only matters for fermionic arrays")
+        tn = self._scalar_tn(fermionic, odd, reverse)
+        expected = tn.contract(all, optimize="auto-hq")
+        bp = qbp.D2BP(tn)
+        bp.run(max_iterations=1000, tol=1e-12)
+
+        # full rank projectors multiply to the identity
+        tnc = bp.compress(max_bond=64, cutoff=0.0)
+        value = tnc.contract(all, optimize="auto-hq")
+        assert value == pytest.approx(expected, rel=1e-10)
+
+    def test_compress_writes_back_positive_messages(
+        self, fermionic, odd, reverse
+    ):
+        # complex data distinguishes a transpose from a dagger
+        if odd and not fermionic:
+            pytest.skip("charge only matters for fermionic arrays")
+        tn = self._scalar_tn(fermionic, odd, reverse, dtype="complex128")
+        bp = qbp.D2BP(tn)
+        bp.run(max_iterations=1000, tol=1e-13)
+        bp.compress(max_bond=64, cutoff=0.0, inplace=True)
+
+        for m in bp.messages.values():
+            d = np.asarray(m.to_dense())
+            d = d / np.linalg.norm(d)
+            assert_allclose(d, d.conj().T, atol=1e-12)
+            assert np.linalg.eigvalsh(d).min() > -1e-12
+
+    def test_compress_twice_reuses_written_back_messages(
+        self, fermionic, odd, reverse
+    ):
+        # a second compression checks that writeback preserves bond dualness
+        if odd and not fermionic:
+            pytest.skip("charge only matters for fermionic arrays")
+        tn = self._scalar_tn(fermionic, odd, reverse, dtype="complex128")
+        expected = tn.contract(all, optimize="auto-hq")
+        bp = qbp.D2BP(tn)
+        bp.run(max_iterations=1000, tol=1e-13)
+
+        # full rank both times, so only identities are ever inserted
+        bp.compress(max_bond=64, cutoff=0.0, inplace=True)
+        tnc = bp.compress(max_bond=64, cutoff=0.0, inplace=True)
+        value = tnc.contract(all, optimize="auto-hq")
+        assert value == pytest.approx(expected, rel=1e-8)
+
+    def test_gauge_symmetric_writes_back_fixed_point(
+        self, fermionic, odd, reverse
+    ):
+        if odd and not fermionic:
+            pytest.skip("charge only matters for fermionic arrays")
+        peps = self._scalar_tn(fermionic, odd, reverse)
+        bp = qbp.D2BP(peps)
+        bp.run(max_iterations=1000, tol=1e-13)
+        bp.gauge_symmetric(inplace=True)
+
+        old = {k: m / m.norm() for k, m in bp.messages.items()}
+        bp.touched.update(bp.exprs)
+        bp.iterate(tol=1e-13)
+        for key, m in bp.messages.items():
+            assert float((m / m.norm() - old[key]).norm()) < 1e-8

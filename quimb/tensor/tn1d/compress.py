@@ -7,6 +7,8 @@ network can locally have arbitrary structure and outer indices.
 - [x] src-oversampled
 - [x] successive deterministic compression (SDC) method
 - [x] sdc-oversampled
+- [x] successive deterministic compression with randomized SVDs (SDCR) method
+- [x] sdcr-oversampled
 - [x] the zip-up method
 - [x] the zip-up first / oversampled method
 - [x] the 1-site variational fit method, including sums of tensor networks
@@ -28,6 +30,7 @@ from ..tensor_core import (
     bonds,
     ensure_dict,
     oset,
+    parse_site_tag_groups,
     rand_uuid,
     tensor_contract,
 )
@@ -172,10 +175,11 @@ def tensor_network_1d_compress_direct(
         The maximum bond dimension to compress to.
     cutoff : float, optional
         A dynamic threshold for discarding singular values when compressing.
-    site_tags : sequence of str, optional
-        The tags to use to group and order the tensors from ``tn``. If not
-        given, uses ``tn.site_tags``. The tensor network built will have one
-        tensor per site, in the order given by ``site_tags``.
+    site_tags : sequence of str or tag groups, optional
+        Tags that identify and order sites. Defaults to ``tn.site_tags``.
+        Each item can group tags as described by
+        :func:`~quimb.tensor.parse_site_tag_groups`. The output has one tensor
+        per item.
     normalize : bool, optional
         Whether to normalize the final tensor network, making use of the fact
         that the output tensor network is in right canonical form.
@@ -242,6 +246,7 @@ def tensor_network_1d_compress_direct(
         site_tags = tn.site_tags
     if sweep_reverse:
         site_tags = tuple(reversed(site_tags))
+    site_tags, untag_groups = parse_site_tag_groups(tn, site_tags)
 
     new = enforce_1d_like(tn, site_tags=site_tags, inplace=inplace)
 
@@ -294,6 +299,7 @@ def tensor_network_1d_compress_direct(
     # possibly put the array indices in canonical order (e.g. when MPS or MPO)
     possibly_permute_(new, permute_arrays)
 
+    untag_groups(new)
     return new
 
 
@@ -380,6 +386,20 @@ def _form_final_tn_from_tensor_sequence(
     return new
 
 
+def _phase_dm_operator(rho: Tensor, left_inds, right_inds):
+    """Apply fermionic signs before decomposing ``rho``.
+
+    If the first left index is not dual, flip all right indices. This makes
+    the kept eigenspace match a direct SVD.
+    """
+    data = rho.data
+    if not data.indices[rho.inds.index(left_inds[0])].dual:
+        axes_to_flip = tuple(
+            axis for axis, ind in enumerate(rho.inds) if ind in right_inds
+        )
+        rho.modify(data=data.phase_flip(*axes_to_flip))
+
+
 def tensor_network_1d_compress_dm(
     tn: TensorNetwork,
     max_bond=None,
@@ -415,10 +435,11 @@ def tensor_network_1d_compress_dm(
     cutoff : float, optional
         The truncation error to use when compressing the double layer tensor
         network.
-    site_tags : sequence of str, optional
-        The tags to use to group and order the tensors from ``tn``. If not
-        given, uses ``tn.site_tags``. The tensor network built will have one
-        tensor per site, in the order given by ``site_tags``.
+    site_tags : sequence of str or tag groups, optional
+        Tags that identify and order sites. Defaults to ``tn.site_tags``.
+        Each item can group tags as described by
+        :func:`~quimb.tensor.parse_site_tag_groups`. The output has one tensor
+        per item.
     normalize : bool, optional
         Whether to normalize the final tensor network, making use of the fact
         that the output tensor network is in right canonical form.
@@ -467,11 +488,11 @@ def tensor_network_1d_compress_dm(
 
     compress_opts = kwargs | ensure_dict(compress_opts)
     compress_opts.setdefault("max_bond", max_bond)
+    compress_opts.setdefault("absorb", "lorthog")
     compress_opts.setdefault("method", "eigh")
     compress_opts.setdefault("positive", 1)
     compress_opts.setdefault("cutoff", cutoff)
     compress_opts.setdefault("cutoff_mode", cutoff_mode)
-    compress_opts.setdefault("absorb", None)
 
     if not canonize:
         warnings.warn("`canonize=False` is ignored for the `dm` method.")
@@ -480,9 +501,11 @@ def tensor_network_1d_compress_dm(
         site_tags = tn.site_tags
     if sweep_reverse:
         site_tags = tuple(reversed(site_tags))
+    site_tags, untag_groups = parse_site_tag_groups(tn, site_tags)
     N = len(site_tags)
 
     ket = enforce_1d_like(tn, site_tags=site_tags, inplace=inplace)
+    fermion = ket.isfermionic()
 
     # partition outer indices, and create conjugate bra indices
     ket_site_inds = []
@@ -506,6 +529,11 @@ def tensor_network_1d_compress_dm(
     norm = bra & ket
     # open the bra's indices back up
     bra.reindex_(ketbra_indmap)
+
+    # map every ket index to its bra layer equivalent
+    kb_indmap = {}
+    for tk, tb in zip(ket.tensors, bra.tensors):
+        kb_indmap.update(zip(tk.inds, tb.inds))
 
     # construct dense left environments
     # (n.b. K, B generally *collection* of tensors)
@@ -564,24 +592,28 @@ def tensor_network_1d_compress_dm(
 
         # contract and then split it
         #
-        #                    │  ┃
+        #                    │  ┃  ... left_inds
         #     │  ┃           UUUU
         #     │  ┃            ┃
         #     rhoi    =>      s    ... bix, with size max_bond
         #     │  ┃            ┃
         #     │  ┃           UHUH
-        #                    │  ┃
+        #                    │  ┃  ... right_inds
         #
         rhoi = tensor_contract(*rho_tensors, **contract_opts)
 
-        # XXX: fermionic, see fix in squared_op_to_reduced_factor
+        if fermion:
+            _phase_dm_operator(rhoi, left_inds, right_inds)
 
-        U, s, UH = rhoi.split(
+        # construct the conjugate projector separately below
+        bix = rand_uuid()
+        U = rhoi.split(
             left_inds=left_inds,
             right_inds=right_inds,
             get="tensors",
+            bond_ind=bix,
             **compress_opts,
-        )
+        )[0]
 
         # turn bond into 'virtual right' indices
         #
@@ -589,13 +621,11 @@ def tensor_network_1d_compress_dm(
         #     UUUU
         #      ┃   ...new_bonds["k", i]
         #     ✂
-        #      ┃   ...new_bonds["b", i]
+        #      ┃   ...new_bonds["b", i], on the conjugate
         #     UHUH
         #     │  ┃
         #
-        (bix,) = s.inds
         U.reindex_({bix: new_bonds["k", i]})
-        UH.reindex_({bix: new_bonds["b", i]})
         Us[i] = U
 
         # attach the unitaries to the right environments and contract
@@ -612,12 +642,15 @@ def tensor_network_1d_compress_dm(
         #       UHUHU†             new_bonds["b", i]
         #         ┃
         #
-        right_ket_tensors = [*ket.select_tensors(site_tags[i]), U.H]
-        right_bra_tensors = [*bra.select_tensors(site_tags[i]), UH.H]
+        if fermion:
+            Uc = _conj_project(U, new_bonds["k", i])
+        else:
+            Uc = U.H
+        kb_indmap[new_bonds["k", i]] = new_bonds["b", i]
+        right_ket_tensors = [*ket.select_tensors(site_tags[i]), Uc]
         if right_env_ket is not None:
             # we have already done one move -> have right envs
             right_ket_tensors.append(right_env_ket)
-            right_bra_tensors.append(right_env_bra)
 
         right_env_ket = tensor_contract(
             *right_ket_tensors,
@@ -630,16 +663,11 @@ def tensor_network_1d_compress_dm(
             right_env_ket, result_exponent = right_env_ket
             exponent += result_exponent
 
-        # TODO: could compute this just as conjugated and relabelled ket env
-        right_env_bra = tensor_contract(
-            *right_bra_tensors,
-            drop_tags=True,
-            strip_exponent=equalize_norms,
-            **contract_opts,
+        # derive the bra environment by conjugating and relabeling the ket
+        right_env_bra = right_env_ket.conj(output_inds=(new_bonds["k", i],))
+        right_env_bra.reindex_(
+            {ix: kb_indmap[ix] for ix in right_env_bra.inds}
         )
-        if equalize_norms:
-            # don't need stripped exponent
-            right_env_bra, _ = right_env_bra
 
     # form the final site
     #
@@ -662,6 +690,7 @@ def tensor_network_1d_compress_dm(
         inplace=inplace,
     )
 
+    untag_groups(new)
     return new
 
 
@@ -672,7 +701,7 @@ def tensor_network_1d_compress_zipup(
     site_tags=None,
     canonize=True,
     normalize=False,
-    cutoff_mode="rsum2",
+    cutoff_mode="rel",
     permute_arrays=True,
     optimize="auto-hq",
     sweep_reverse=False,
@@ -705,16 +734,17 @@ def tensor_network_1d_compress_zipup(
         The maximum bond dimension to compress to.
     cutoff : float, optional
         A dynamic threshold for discarding singular values when compressing.
-    site_tags : sequence of str, optional
-        The tags to use to group and order the tensors from ``tn``. If not
-        given, uses ``tn.site_tags``. The tensor network built will have one
-        tensor per site, in the order given by ``site_tags``.
+    site_tags : sequence of str or tag groups, optional
+        Tags that identify and order sites. Defaults to ``tn.site_tags``.
+        Each item can group tags as described by
+        :func:`~quimb.tensor.parse_site_tag_groups`. The output has one tensor
+        per item.
     canonize : bool, optional
         Whether to pseudo canonicalize the initial tensor network.
     normalize : bool, optional
         Whether to normalize the final tensor network, making use of the fact
         that the output tensor network is in right canonical form.
-    cutoff_mode : {"rsum2", "rel", ...}, optional
+    cutoff_mode : {"rel", "rsum2", ...}, optional
         The mode to use when truncating the singular values of the decomposed
         tensors. See :func:`~quimb.tensor.tensor_split`.
     permute_arrays : bool or str, optional
@@ -768,6 +798,7 @@ def tensor_network_1d_compress_zipup(
         site_tags = tn.site_tags
     if sweep_reverse:
         site_tags = tuple(reversed(site_tags))
+    site_tags, untag_groups = parse_site_tag_groups(tn, site_tags)
     N = len(site_tags)
 
     tn = enforce_1d_like(tn, site_tags=site_tags, inplace=inplace)
@@ -861,6 +892,7 @@ def tensor_network_1d_compress_zipup(
         inplace=inplace,
     )
 
+    untag_groups(new)
     return new
 
 
@@ -913,11 +945,12 @@ def tensor_network_1d_compress_zipup_oversample(
     max_bond=None,
     max_bond_oversample=None,
     cutoff=1e-10,
-    cutoff_oversample=None,
+    cutoff_oversample="auto",
     site_tags=None,
     canonize=True,
     normalize=False,
     cutoff_mode="rsum2",
+    cutoff_mode_oversample="rel",
     permute_arrays=True,
     optimize="auto-hq",
     sweep_reverse=False,
@@ -925,6 +958,7 @@ def tensor_network_1d_compress_zipup_oversample(
     contract_opts=None,
     canonize_opts=None,
     compress_opts=None,
+    compress_opts_final=None,
     inplace=False,
     **kwargs,
 ):
@@ -953,23 +987,27 @@ def tensor_network_1d_compress_zipup_oversample(
         twice the target bond dimension, ``2 * max_bond``.
     cutoff : float, optional
         A dynamic threshold for discarding singular values when compressing.
-    cutoff_oversample : float, optional
+    cutoff_oversample : float or "auto", optional
         A dynamic threshold for discarding singular values when compressing to
-        the intermediate bond dimension using the 'zip-up' algorithm. If not
-        given, this is set to the same as ``cutoff`` if a maximum bond is
-        given, else ``cutoff / 10``.
-    site_tags : sequence of str, optional
-        The tags to use to group and order the tensors from ``tn``. If not
-        given, uses ``tn.site_tags``. The tensor network built will have one
-        tensor per site, in the order given by ``site_tags``.
+        the intermediate bond dimension using the 'zip-up' algorithm.
+        With ``"auto"``, use ``0.0`` for randomized SVD and ``1e-10`` for
+        exact decompositions, independently of the final sweep's ``cutoff``.
+    site_tags : sequence of str or tag groups, optional
+        Tags that identify and order sites. Defaults to ``tn.site_tags``.
+        Each item can group tags as described by
+        :func:`~quimb.tensor.parse_site_tag_groups`. The output has one tensor
+        per item.
     canonize : bool, optional
         Whether to pseudo canonicalize the initial tensor network.
     normalize : bool, optional
         Whether to normalize the final tensor network, making use of the fact
         that the output tensor network is in right canonical form.
     cutoff_mode : {"rsum2", "rel", ...}, optional
-        The mode to use when truncating the singular values of the decomposed
-        tensors. See :func:`~quimb.tensor.tensor_split`.
+        The mode used in the final canonical sweep.
+        See :func:`~quimb.tensor.tensor_split`.
+    cutoff_mode_oversample : {"rel", "rsum2", ...}, optional
+        The mode used in the intermediate pseudo-canonical zipup step,
+        independently of the final sweep. Defaults to ``"rel"``.
     permute_arrays : bool or str, optional
         Whether to permute the array indices of the final tensor network into
         canonical order. If ``True`` will use the default order, otherwise if a
@@ -989,12 +1027,15 @@ def tensor_network_1d_compress_zipup_oversample(
     canonize_opts : dict, optional
         Supplied to :func:`tensor_network_1d_compress_zipup` when
         pseudo-canonicalizing in the oversampling step.
+    compress_opts : dict, optional
+        Supplied to :func:`~quimb.tensor.tensor_split` in the intermediate
+        zipup step only. Values set here take precedence over defaults.
+    compress_opts_final : dict, optional
+        Options for the final direct sweep, independently of ``compress_opts``.
+        Defaults to exact SVD. Values set here override the final sweep's
+        ``max_bond``, ``cutoff``, and ``cutoff_mode``.
     inplace : bool, optional
         Whether to perform the compression inplace or not.
-    compress_opts : dict, optional
-        Supplied to :func:`~quimb.tensor.tensor_split` in the oversampling step
-        and to :func:`~quimb.tensor.TensorNetwork.compress_between` in the
-        final direct sweep. Values set here take precedence over defaults.
     kwargs
         Extra keyword arguments are combined into `compress_opts`, though
         existing items in `compress_opts` take precedence over `kwargs`.
@@ -1030,18 +1071,11 @@ def tensor_network_1d_compress_zipup_oversample(
         # assume manually supplied, `max_bond` is not needed
         max_bond_oversample = int(max_bond_oversample)
 
-    if cutoff_oversample is None:
-        if max_bond is None:
-            # fully dynamic mode
-            cutoff_oversample = cutoff / 10
-        else:
-            # assume max_bond limited
-            cutoff_oversample = cutoff
-
     if site_tags is None:
         site_tags = tn.site_tags
     if sweep_reverse:
         site_tags = tuple(reversed(site_tags))
+    site_tags, untag_groups = parse_site_tag_groups(tn, site_tags)
 
     # yields right canonical form w.r.t site_tags
     tn = tensor_network_1d_compress_zipup(
@@ -1050,7 +1084,7 @@ def tensor_network_1d_compress_zipup_oversample(
         cutoff=cutoff_oversample,
         site_tags=site_tags,
         canonize=canonize,
-        cutoff_mode=cutoff_mode,
+        cutoff_mode=cutoff_mode_oversample,
         optimize=optimize,
         sweep_reverse=True,
         equalize_norms=equalize_norms,
@@ -1060,7 +1094,7 @@ def tensor_network_1d_compress_zipup_oversample(
         inplace=inplace,
     )
     # direct sweep in other direction
-    return _do_direct_sweep(
+    new = _do_direct_sweep(
         tn=tn,
         site_tags=site_tags,
         max_bond=max_bond,
@@ -1069,16 +1103,18 @@ def tensor_network_1d_compress_zipup_oversample(
         equalize_norms=equalize_norms,
         normalize=normalize,
         permute_arrays=permute_arrays,
-        compress_opts=compress_opts,
+        compress_opts=compress_opts_final,
     )
+
+    untag_groups(new)
+    return new
 
 
 def _conj_project(tq: Tensor, bond_ind: str) -> Tensor:
     """Conjugate the isometry ``tq``, such that the pair resolves to the
     identity when inserted back into a tensor network on ``bond_ind``.
 
-    Fermionic data needs a phase flip on the contracted indices sharing
-    ``bond_ind``'s dualness, and a global sign if of odd parity.
+    Fermionic data needs possible phases on the contracted indices.
 
     Parameters
     ----------
@@ -1092,22 +1128,13 @@ def _conj_project(tq: Tensor, bond_ind: str) -> Tensor:
     -------
     Tensor
     """
-    tqc = tq.conj()
+    tqc = tq.copy()
 
-    if tqc.isfermionic():
-        # TODO: replace with an ndim general `conj_project` in symmray
-        data = tqc.data
-        bdual = data.indices[tqc.inds.index(bond_ind)].dual
-        axs = tuple(
-            ax
-            for ax, ix in enumerate(tqc.inds)
-            if (ix != bond_ind) and (data.indices[ax].dual is bdual)
-        )
-        if axs:
-            tqc.modify(data=data.phase_flip(*axs))
-        # arrays of odd parity also pick up a global sign
-        if bdual and sum(m.parity for m in tqc.data.dummy_modes) % 2:
-            tqc.modify(data=tqc.data.phase_global())
+    if tq.isfermionic():
+        axes = tq.inds.index(bond_ind)
+        tqc.modify(data=tq.data.conj_project(axes=axes))
+    else:
+        tqc.conj_()
 
     return tqc
 
@@ -1174,6 +1201,7 @@ def _do_sweep_compress_from_low_rank_left_envs(
     project_opts = ensure_dict(project_opts)
     project_opts.setdefault("method", "qr")
     project_opts.setdefault("absorb", "lorthog")
+    project_opts.setdefault("cutoff", 0.0)
 
     # we sweep in from the right
     L = len(local_tns)
@@ -1328,7 +1356,7 @@ def tensor_network_1d_compress_sdc(
     cutoff=1e-10,
     site_tags=None,
     normalize=False,
-    cutoff_mode="rsum2",
+    cutoff_mode="rel",
     permute_arrays=True,
     optimize="auto-hq",
     sweep_reverse=False,
@@ -1359,14 +1387,15 @@ def tensor_network_1d_compress_sdc(
     cutoff : float, optional
         A dynamic threshold for discarding singular values when forming the
         low-rank left environments.
-    site_tags : sequence of str, optional
-        The tags to use to group and order the tensors from ``tn``. If not
-        given, uses ``tn.site_tags``. The tensor network built will have one
-        tensor per site, in the order given by ``site_tags``.
+    site_tags : sequence of str or tag groups, optional
+        Tags that identify and order sites. Defaults to ``tn.site_tags``.
+        Each item can group tags as described by
+        :func:`~quimb.tensor.parse_site_tag_groups`. The output has one tensor
+        per item.
     normalize : bool, optional
         Whether to normalize the final tensor network, making use of the fact
         that the output tensor network is in right canonical form.
-    cutoff_mode : {"rsum2", "rel", ...}, optional
+    cutoff_mode : {"rel", "rsum2", ...}, optional
         The mode to use when truncating the singular values of the left
         environments. See :func:`~quimb.tensor.tensor_split`.
     permute_arrays : bool or str, optional
@@ -1395,8 +1424,8 @@ def tensor_network_1d_compress_sdc(
         precedence over defaults.
     compress_opts : dict, optional
         Supplied to :func:`~quimb.tensor.tensor_split` when forming the
-        low-rank left environments. Values set here take precedence over
-        defaults.
+        low-rank left environments, defaulting to ``method="svd:eig"``. Values
+        set here take precedence over defaults.
     inplace : bool, optional
         Whether to perform the compression inplace or not.
     kwargs
@@ -1418,6 +1447,7 @@ def tensor_network_1d_compress_sdc(
     contract_opts.setdefault("drop_tags", True)
 
     compress_opts = kwargs | ensure_dict(compress_opts)
+    compress_opts.setdefault("method", "svd:eig")
     compress_opts.setdefault("max_bond", max_bond)
     compress_opts.setdefault("cutoff", cutoff)
     compress_opts.setdefault("cutoff_mode", cutoff_mode)
@@ -1427,6 +1457,7 @@ def tensor_network_1d_compress_sdc(
         site_tags = tn.site_tags
     if sweep_reverse:
         site_tags = tuple(reversed(site_tags))
+    site_tags, untag_groups = parse_site_tag_groups(tn, site_tags)
     L = len(site_tags)
 
     tn = enforce_1d_like(tn, site_tags=site_tags, inplace=inplace)
@@ -1486,7 +1517,7 @@ def tensor_network_1d_compress_sdc(
         left_envs[i + 1] = tr
         left_env_inds[i + 1] = (next_bix,)
 
-    return _do_sweep_compress_from_low_rank_left_envs(
+    new = _do_sweep_compress_from_low_rank_left_envs(
         tn=tn,
         local_tns=local_tns,
         left_envs=left_envs,
@@ -1500,6 +1531,9 @@ def tensor_network_1d_compress_sdc(
         inplace=inplace,
     )
 
+    untag_groups(new)
+    return new
+
 
 def tensor_network_1d_compress_sdc_oversample(
     tn: TensorNetwork,
@@ -1511,6 +1545,7 @@ def tensor_network_1d_compress_sdc_oversample(
     canonize=True,
     normalize=False,
     cutoff_mode="rsum2",
+    cutoff_mode_oversample="rel",
     permute_arrays=True,
     optimize="auto-hq",
     sweep_reverse=False,
@@ -1518,6 +1553,7 @@ def tensor_network_1d_compress_sdc_oversample(
     contract_opts=None,
     project_opts=None,
     compress_opts=None,
+    compress_opts_final=None,
     inplace=False,
     **kwargs,
 ):
@@ -1544,10 +1580,11 @@ def tensor_network_1d_compress_sdc_oversample(
     cutoff_oversample : float, optional
         A dynamic threshold for discarding singular values when forming the
         SDC left environments at the intermediate bond dimension.
-    site_tags : sequence of str, optional
-        The tags to use to group and order the tensors from ``tn``. If not
-        given, uses ``tn.site_tags``. The tensor network built will have one
-        tensor per site, in the order given by ``site_tags``.
+    site_tags : sequence of str or tag groups, optional
+        Tags that identify and order sites. Defaults to ``tn.site_tags``.
+        Each item can group tags as described by
+        :func:`~quimb.tensor.parse_site_tag_groups`. The output has one tensor
+        per item.
     canonize : bool, optional
         Whether to pseudo canonicalize the initial tensor network. This is not
         used by the SDC method, and so ignored.
@@ -1555,8 +1592,11 @@ def tensor_network_1d_compress_sdc_oversample(
         Whether to normalize the final tensor network, making use of the fact
         that the output tensor network is in right canonical form.
     cutoff_mode : {"rsum2", "rel", ...}, optional
-        The mode to use when truncating singular values in both compression
-        sweeps. See :func:`~quimb.tensor.tensor_split`.
+        The mode used in the final canonical sweep.
+        See :func:`~quimb.tensor.tensor_split`.
+    cutoff_mode_oversample : {"rel", "rsum2", ...}, optional
+        The mode used for the intermediate low-rank left environments,
+        independently of the final sweep. Defaults to ``"rel"``.
     permute_arrays : bool or str, optional
         Whether to permute the array indices of the final tensor network into
         canonical order. If ``True`` will use the default order, otherwise if a
@@ -1578,9 +1618,12 @@ def tensor_network_1d_compress_sdc_oversample(
         orthogonal projectors in the SDC step. Values set here take precedence
         over defaults.
     compress_opts : dict, optional
-        Supplied to :func:`~quimb.tensor.tensor_split` in the SDC step and to
-        :func:`~quimb.tensor.TensorNetwork.compress_between` in the final
-        direct sweep. Values set here take precedence over defaults.
+        Supplied to :func:`~quimb.tensor.tensor_split` in the intermediate
+        SDC step only. Values set here take precedence over defaults.
+    compress_opts_final : dict, optional
+        Options for the final direct sweep, independently of ``compress_opts``.
+        Defaults to exact SVD. Values set here override the final sweep's
+        ``max_bond``, ``cutoff``, and ``cutoff_mode``.
     inplace : bool, optional
         Whether to perform the compression inplace or not.
     kwargs
@@ -1617,6 +1660,7 @@ def tensor_network_1d_compress_sdc_oversample(
         site_tags = tn.site_tags
     if sweep_reverse:
         site_tags = tuple(reversed(site_tags))
+    site_tags, untag_groups = parse_site_tag_groups(tn, site_tags)
 
     # yields right canonical form with respect to site_tags
     tn = tensor_network_1d_compress_sdc(
@@ -1625,7 +1669,7 @@ def tensor_network_1d_compress_sdc_oversample(
         cutoff=cutoff_oversample,
         site_tags=site_tags,
         normalize=False,
-        cutoff_mode=cutoff_mode,
+        cutoff_mode=cutoff_mode_oversample,
         permute_arrays=False,
         optimize=optimize,
         sweep_reverse=True,
@@ -1637,7 +1681,7 @@ def tensor_network_1d_compress_sdc_oversample(
     )
 
     # direct sweep in the other direction
-    return _do_direct_sweep(
+    new = _do_direct_sweep(
         tn=tn,
         site_tags=site_tags,
         max_bond=max_bond,
@@ -1646,8 +1690,293 @@ def tensor_network_1d_compress_sdc_oversample(
         equalize_norms=equalize_norms,
         normalize=normalize,
         permute_arrays=permute_arrays,
-        compress_opts=compress_opts,
+        compress_opts=compress_opts_final,
     )
+
+    untag_groups(new)
+    return new
+
+
+def tensor_network_1d_compress_sdcr(
+    tn: TensorNetwork,
+    max_bond: int,
+    cutoff="auto",
+    site_tags=None,
+    normalize=False,
+    cutoff_mode="rel",
+    permute_arrays=True,
+    optimize="auto-hq",
+    sweep_reverse=False,
+    canonize=True,
+    equalize_norms=False,
+    contract_opts=None,
+    project_opts=None,
+    compress_opts=None,
+    inplace=False,
+    **kwargs,
+):
+    """Compress any 1D-like tensor network using 'Successive Deterministic
+    Compression' (SDC) https://arxiv.org/abs/2601.19650, but forming the
+    low-rank left environments with a randomized rather than exact SVD. Since
+    the left environments are just a 'sketch' and can be very rough, no
+    oversampling or power iterations are used by default.
+
+    Parameters
+    ----------
+    tn : TensorNetwork
+        The tensor network to compress. Every tensor should have exactly one of
+        the site tags. Each site can have multiple tensors and output indices.
+    max_bond : int
+        The maximum bond dimension to compress to, also the rank of the
+        randomized sketches.
+    cutoff : float or "auto", optional
+        A non-cumulative threshold for discarding singular values. With
+        ``"auto"``, use only ``max_bond``.
+    site_tags : sequence of str or tag groups, optional
+        Tags that identify and order sites. Defaults to ``tn.site_tags``.
+        Each item can group tags as described by
+        :func:`~quimb.tensor.parse_site_tag_groups`. The output has one tensor
+        per item.
+    normalize : bool, optional
+        Whether to normalize the final tensor network, making use of the fact
+        that the output tensor network is in right canonical form.
+    cutoff_mode : {"rel", "abs"}, optional
+        The mode to use when truncating the singular values of the left
+        environments. Defaults to ``"rel"``. See
+        :func:`~quimb.tensor.tensor_split`.
+    permute_arrays : bool or str, optional
+        Whether to permute the array indices of the final tensor network into
+        canonical order. If ``True`` will use the default order, otherwise if a
+        string this specifies a custom order.
+    optimize : str, optional
+        The contraction path optimizer to use.
+    sweep_reverse : bool, optional
+        Whether to sweep in the reverse direction, resulting in a left
+        canonical form instead of right canonical.
+    canonize : bool, optional
+        Whether to pseudo canonicalize the initial tensor network. This is not
+        used by the SDC method, and so ignored.
+    equalize_norms : bool or float, optional
+        Whether to equalize the norms of the tensors after compression. If an
+        explicit value is given, then the norms will be set to that value, and
+        the overall scaling factor will be accumulated into `.exponent`.
+    contract_opts : dict, optional
+        Supplied to :func:`~quimb.tensor.tensor_contract`. Values set here
+        take precedence over any defaults.
+    project_opts : dict, optional
+        Supplied to :func:`~quimb.tensor.tensor_split` when forming the
+        orthogonal projectors in the final sweep. The method should produce a
+        left isometry, for example ``method="svd:eig"``. Values set here take
+        precedence over defaults.
+    compress_opts : dict, optional
+        Supplied to :func:`~quimb.tensor.tensor_split` when forming the
+        low-rank left environments, defaulting to
+        ``method="svd:rand", num_iterations=0, oversample=0``. Values set here
+        take precedence over defaults, for example ``oversample=10`` for more
+        accurate sketches, or ``seed=42`` for reproducibility.
+    inplace : bool, optional
+        Whether to perform the compression inplace or not.
+    kwargs
+        Extra keyword arguments are combined into `compress_opts`, though
+        existing items in `compress_opts` take precedence over `kwargs`.
+
+    Returns
+    -------
+    TensorNetwork
+        The compressed tensor network, with canonical center at
+        ``site_tags[0]`` ('right canonical' form) or ``site_tags[-1]`` ('left
+        canonical' form) if ``sweep_reverse``.
+    """
+    if max_bond is None:
+        raise ValueError("`max_bond` must be given for the `sdcr` method.")
+
+    if not canonize:
+        warnings.warn("`canonize=False` is ignored for the `sdcr` method.")
+
+    compress_opts = kwargs | ensure_dict(compress_opts)
+    compress_opts.setdefault("method", "svd:rand")
+    compress_opts.setdefault("num_iterations", 0)
+    compress_opts.setdefault("oversample", 0)
+
+    return tensor_network_1d_compress_sdc(
+        tn,
+        max_bond=max_bond,
+        cutoff=cutoff,
+        site_tags=site_tags,
+        normalize=normalize,
+        cutoff_mode=cutoff_mode,
+        permute_arrays=permute_arrays,
+        optimize=optimize,
+        sweep_reverse=sweep_reverse,
+        equalize_norms=equalize_norms,
+        contract_opts=contract_opts,
+        project_opts=project_opts,
+        compress_opts=compress_opts,
+        inplace=inplace,
+    )
+
+
+def tensor_network_1d_compress_sdcr_oversample(
+    tn: TensorNetwork,
+    max_bond: int,
+    max_bond_oversample=None,
+    cutoff=1e-10,
+    cutoff_oversample=0.0,
+    site_tags=None,
+    canonize=True,
+    normalize=False,
+    cutoff_mode="rsum2",
+    cutoff_mode_oversample="rel",
+    permute_arrays=True,
+    optimize="auto-hq",
+    sweep_reverse=False,
+    equalize_norms=False,
+    contract_opts=None,
+    project_opts=None,
+    compress_opts=None,
+    compress_opts_final=None,
+    inplace=False,
+    **kwargs,
+):
+    """Compress this 1D-like tensor network using the 'sdcr-oversample'
+    algorithm, that is, first compressing the tensor network to a larger bond
+    dimension using successive deterministic compression with random sketches,
+    then compressing to the desired bond dimension using a direct sweep.
+
+    Parameters
+    ----------
+    tn : TensorNetwork
+        The tensor network to compress. Every tensor should have exactly one of
+        the site tags. Each site can have multiple tensors and output indices.
+    max_bond : int
+        The final maximum bond dimension to compress to.
+    max_bond_oversample : int, optional
+        The intermediate maximum bond dimension to compress to using the SDCR
+        algorithm. If not given, this is set as
+        ``max(round(1.5 * max_bond), max_bond + 10)``. If given as a float,
+        this is assumed to be a multiplier of `max_bond`.
+    cutoff : float, optional
+        A dynamic threshold for discarding singular values during the final
+        direct sweep.
+    cutoff_oversample : float, optional
+        A non-cumulative threshold for discarding singular values in the SDCR
+        step, interpreted using ``cutoff_mode_oversample``.
+    cutoff_mode_oversample : {"rel", "abs"}, optional
+        How to interpret the SDCR step's cutoff. Defaults to ``"rel"``,
+        independently of the final direct sweep's ``cutoff_mode``.
+    site_tags : sequence of str or tag groups, optional
+        Tags that identify and order sites. Defaults to ``tn.site_tags``.
+        Each item can group tags as described by
+        :func:`~quimb.tensor.parse_site_tag_groups`. The output has one tensor
+        per item.
+    canonize : bool, optional
+        Whether to pseudo canonicalize the initial tensor network. This is not
+        used by the SDC method, and so ignored.
+    normalize : bool, optional
+        Whether to normalize the final tensor network, making use of the fact
+        that the output tensor network is in right canonical form.
+    cutoff_mode : {"rsum2", "rel", ...}, optional
+        The mode to use when truncating singular values in the final direct
+        sweep. See :func:`~quimb.tensor.tensor_split`.
+    permute_arrays : bool or str, optional
+        Whether to permute the array indices of the final tensor network into
+        canonical order. If ``True`` will use the default order, otherwise if a
+        string this specifies a custom order.
+    optimize : str, optional
+        The contraction path optimizer to use.
+    sweep_reverse : bool, optional
+        Whether to sweep in the reverse direction, resulting in a left
+        canonical form instead of right canonical.
+    equalize_norms : bool or float, optional
+        Whether to equalize the norms of the tensors after compression. If an
+        explicit value is given, then the norms will be set to that value, and
+        the overall scaling factor will be accumulated into `.exponent`.
+    contract_opts : dict, optional
+        Supplied to :func:`~quimb.tensor.tensor_contract`. Values set here
+        take precedence over any defaults.
+    project_opts : dict, optional
+        Supplied to :func:`~quimb.tensor.tensor_split` when forming the
+        orthogonal projectors in the SDCR step. Values set here take precedence
+        over defaults.
+    compress_opts : dict, optional
+        Supplied to :func:`~quimb.tensor.tensor_split` in the SDCR step, where
+        the randomized defaults are applied. These options only affect the
+        intermediate step and take precedence over defaults.
+    compress_opts_final : dict, optional
+        Options for the final direct sweep, independently of ``compress_opts``.
+        Defaults to exact SVD. Values set here override the final sweep's
+        ``max_bond``, ``cutoff``, and ``cutoff_mode``.
+    inplace : bool, optional
+        Whether to perform the compression inplace or not.
+    kwargs
+        Extra keyword arguments are combined into `compress_opts`, though
+        existing items in `compress_opts` take precedence over `kwargs`.
+
+    Returns
+    -------
+    TensorNetwork
+        The compressed tensor network, with canonical center at
+        ``site_tags[0]`` ('right canonical' form) or ``site_tags[-1]`` ('left
+        canonical' form) if ``sweep_reverse``.
+    """
+    compress_opts = kwargs | ensure_dict(compress_opts)
+
+    if max_bond is None:
+        raise ValueError(
+            "`max_bond` must be given for the `sdcr-oversample` method."
+        )
+
+    if max_bond_oversample is None:
+        max_bond_oversample = max(round(1.5 * max_bond), max_bond + 10)
+    elif isinstance(max_bond_oversample, float):
+        max_bond_oversample = round(max_bond * max_bond_oversample)
+    else:
+        max_bond_oversample = int(max_bond_oversample)
+
+    if not canonize:
+        warnings.warn(
+            "`canonize=False` is ignored for the `sdcr-oversample` method."
+        )
+
+    if site_tags is None:
+        site_tags = tn.site_tags
+    if sweep_reverse:
+        site_tags = tuple(reversed(site_tags))
+    site_tags, untag_groups = parse_site_tag_groups(tn, site_tags)
+
+    # yields right canonical form with respect to site_tags
+    tn = tensor_network_1d_compress_sdcr(
+        tn,
+        max_bond=max_bond_oversample,
+        cutoff=cutoff_oversample,
+        site_tags=site_tags,
+        normalize=False,
+        cutoff_mode=cutoff_mode_oversample,
+        permute_arrays=False,
+        optimize=optimize,
+        sweep_reverse=True,
+        equalize_norms=equalize_norms,
+        contract_opts=contract_opts,
+        project_opts=project_opts,
+        compress_opts=compress_opts,
+        inplace=inplace,
+    )
+
+    # direct sweep in the other direction, always exact
+    new = _do_direct_sweep(
+        tn=tn,
+        site_tags=site_tags,
+        max_bond=max_bond,
+        cutoff=cutoff,
+        cutoff_mode=cutoff_mode,
+        equalize_norms=equalize_norms,
+        normalize=normalize,
+        permute_arrays=permute_arrays,
+        compress_opts=compress_opts_final,
+    )
+
+    untag_groups(new)
+    return new
 
 
 def tensor_network_1d_compress_src(
@@ -1681,10 +2010,11 @@ def tensor_network_1d_compress_src(
         The maximum bond dimension to compress to.
     cutoff : float, optional
         Unused for SRC, use ``max_bond``.
-    site_tags : sequence of str, optional
-        The tags to use to group and order the tensors from ``tn``. If not
-        given, uses ``tn.site_tags``. The tensor network built will have one
-        tensor per site, in the order given by ``site_tags``.
+    site_tags : sequence of str or tag groups, optional
+        Tags that identify and order sites. Defaults to ``tn.site_tags``.
+        Each item can group tags as described by
+        :func:`~quimb.tensor.parse_site_tag_groups`. The output has one tensor
+        per item.
     normalize : bool, optional
         Whether to normalize the final tensor network, making use of the fact
         that the output tensor network is in right canonical form.
@@ -1693,7 +2023,7 @@ def tensor_network_1d_compress_src(
         random tensor for all outer indices on a site. 'separable' generates a
         random vector for each outer index. 'symmetric' reuses the same random
         vector for all outer indices on a site.
-    noise_dist : {"normal", "uniform", "rademacher"}, optional
+    noise_dist : {"normal", "rademacher"}, optional
         The distribution to use when generating the random noise tensors.
     seed : None, int, or random generator, optional
         A random seed or generator to use. If not given, use the backend's
@@ -1759,6 +2089,7 @@ def tensor_network_1d_compress_src(
         site_tags = tn.site_tags
     if sweep_reverse:
         site_tags = tuple(reversed(site_tags))
+    site_tags, untag_groups = parse_site_tag_groups(tn, site_tags)
     L = len(site_tags)
 
     tn = enforce_1d_like(tn, site_tags=site_tags, inplace=inplace)
@@ -1825,7 +2156,7 @@ def tensor_network_1d_compress_src(
         if equalize_norms:
             left_envs[i].normalize_()
 
-    return _do_sweep_compress_from_low_rank_left_envs(
+    new = _do_sweep_compress_from_low_rank_left_envs(
         tn=tn,
         local_tns=local_tns,
         left_envs=left_envs,
@@ -1838,6 +2169,9 @@ def tensor_network_1d_compress_src(
         permute_arrays=permute_arrays,
         inplace=inplace,
     )
+
+    untag_groups(new)
+    return new
 
 
 def tensor_network_1d_compress_src_oversample(
@@ -1860,6 +2194,7 @@ def tensor_network_1d_compress_src_oversample(
     contract_opts=None,
     project_opts=None,
     compress_opts=None,
+    compress_opts_final=None,
     inplace=False,
     **kwargs,
 ):
@@ -1888,16 +2223,17 @@ def tensor_network_1d_compress_src_oversample(
         Unused for SRC.
     noise_mode : {'separable', 'symmetric', 'joint'}, optional
         How to generate the random noise tensors for the SRC step.
-    noise_dist : {"normal", "uniform", "rademacher"}, optional
+    noise_dist : {"normal", "rademacher"}, optional
         The distribution to use when generating the random noise tensors for
         the SRC step.
     seed : None, int, or random generator, optional
         A random seed or generator to use for the SRC step. If not given, use
         the backend's global random state.
-    site_tags : sequence of str, optional
-        The tags to use to group and order the tensors from ``tn``. If not
-        given, uses ``tn.site_tags``. The tensor network built will have one
-        tensor per site, in the order given by ``site_tags``.
+    site_tags : sequence of str or tag groups, optional
+        Tags that identify and order sites. Defaults to ``tn.site_tags``.
+        Each item can group tags as described by
+        :func:`~quimb.tensor.parse_site_tag_groups`. The output has one tensor
+        per item.
     canonize : bool, optional
         Whether to pseudo canonicalize the initial tensor network.
     normalize : bool, optional
@@ -1932,6 +2268,10 @@ def tensor_network_1d_compress_src_oversample(
     compress_opts : dict, optional
         Supplied to :func:`~quimb.tensor.tensor_split` during the final direct
         sweep. Values set here take precedence over defaults.
+    compress_opts_final : dict, optional
+        Options for the final direct sweep. Values set here take precedence
+        over ``compress_opts`` and ``kwargs``, which also target the final
+        sweep for this method.
     kwargs
         Extra keyword arguments are combined into `compress_opts`, though
         existing items in `compress_opts` take precedence over `kwargs`.
@@ -1944,7 +2284,9 @@ def tensor_network_1d_compress_src_oversample(
     contract_opts = ensure_dict(contract_opts)
     contract_opts.setdefault("optimize", optimize)
 
-    compress_opts = kwargs | ensure_dict(compress_opts)
+    compress_opts = (
+        kwargs | ensure_dict(compress_opts) | ensure_dict(compress_opts_final)
+    )
 
     if max_bond is None:
         raise ValueError(
@@ -1970,6 +2312,7 @@ def tensor_network_1d_compress_src_oversample(
         site_tags = tn.site_tags
     if sweep_reverse:
         site_tags = tuple(reversed(site_tags))
+    site_tags, untag_groups = parse_site_tag_groups(tn, site_tags)
 
     # yields right canonical form w.r.t site_tags
     tn = tensor_network_1d_compress_src(
@@ -1989,7 +2332,7 @@ def tensor_network_1d_compress_src_oversample(
         inplace=inplace,
     )
     # direct sweep in other direction
-    return _do_direct_sweep(
+    new = _do_direct_sweep(
         tn=tn,
         site_tags=site_tags,
         max_bond=max_bond,
@@ -2000,6 +2343,9 @@ def tensor_network_1d_compress_src_oversample(
         permute_arrays=permute_arrays,
         compress_opts=compress_opts,
     )
+
+    untag_groups(new)
+    return new
 
 
 def tensor_network_1d_compress_srcmps(
@@ -2039,14 +2385,15 @@ def tensor_network_1d_compress_srcmps(
         sets the compression rank). If not given, a random MPS with bond
         dimension ``max_bond`` is used. If a string or dict, this is used to
         construct the MPS from ``tn``.
-    site_tags : sequence of str, optional
-        The tags to use to group and order the tensors from ``tn``. If not
-        given, uses ``tn.site_tags``. The tensor network built will have one
-        tensor per site, in the order given by ``site_tags``.
+    site_tags : sequence of str or tag groups, optional
+        Tags that identify and order sites. Defaults to ``tn.site_tags``.
+        Each item can group tags as described by
+        :func:`~quimb.tensor.parse_site_tag_groups`. The output has one tensor
+        per item.
     normalize : bool, optional
         Whether to normalize the final tensor network, making use of the fact
         that the output tensor network is in right canonical form.
-    noise_dist : {"normal", "uniform", "rademacher"}, optional
+    noise_dist : {"normal", "rademacher"}, optional
         The distribution to use when generating the random sampling MPS, only
         relevant if ``tn_fit`` is not supplied.
     seed : None, int, or random generator, optional
@@ -2107,6 +2454,7 @@ def tensor_network_1d_compress_srcmps(
         site_tags = tn.site_tags
     if sweep_reverse:
         site_tags = tuple(reversed(site_tags))
+    site_tags, untag_groups = parse_site_tag_groups(tn, site_tags)
     L = len(site_tags)
 
     tn = enforce_1d_like(tn, site_tags=site_tags, inplace=inplace)
@@ -2160,7 +2508,7 @@ def tensor_network_1d_compress_srcmps(
         # get the bonds along the sampling MPS
         left_env_inds[i] = tn_fit[site_tags[i - 1]].bonds(tn_fit[site_tags[i]])
 
-    return _do_sweep_compress_from_low_rank_left_envs(
+    new = _do_sweep_compress_from_low_rank_left_envs(
         tn=tn,
         local_tns=local_tns,
         left_envs=left_envs,
@@ -2173,6 +2521,9 @@ def tensor_network_1d_compress_srcmps(
         permute_arrays=permute_arrays,
         inplace=inplace,
     )
+
+    untag_groups(new)
+    return new
 
 
 def tensor_network_1d_compress_srcmps_oversample(
@@ -2195,6 +2546,7 @@ def tensor_network_1d_compress_srcmps_oversample(
     contract_opts=None,
     project_opts=None,
     compress_opts=None,
+    compress_opts_final=None,
     inplace=False,
     **kwargs,
 ):
@@ -2225,16 +2577,17 @@ def tensor_network_1d_compress_srcmps_oversample(
     tn_fit : TensorNetwork, optional
         The MPS specificing the sampling noise (its bond dimension effectively
         sets the compression rank).
-    noise_dist : {"normal", "uniform", "rademacher"}, optional
+    noise_dist : {"normal", "rademacher"}, optional
         The distribution to use when generating the random sampling MPS, only
         relevant if ``tn_fit`` is not supplied.
     seed : None, int, or random generator, optional
         A random seed or generator to use for the SRCMPS step. If not given,
         use the backend's global random state.
-    site_tags : sequence of str, optional
-        The tags to use to group and order the tensors from ``tn``. If not
-        given, uses ``tn.site_tags``. The tensor network built will have one
-        tensor per site, in the order given by ``site_tags``.
+    site_tags : sequence of str or tag groups, optional
+        Tags that identify and order sites. Defaults to ``tn.site_tags``.
+        Each item can group tags as described by
+        :func:`~quimb.tensor.parse_site_tag_groups`. The output has one tensor
+        per item.
     canonize : bool, optional
         Whether to pseudo canonicalize the initial tensor network.
     normalize : bool, optional
@@ -2267,6 +2620,10 @@ def tensor_network_1d_compress_srcmps_oversample(
     compress_opts : dict, optional
         Supplied to :func:`~quimb.tensor.tensor_split` during the final direct
         sweep. Values set here take precedence over defaults.
+    compress_opts_final : dict, optional
+        Options for the final direct sweep. Values set here take precedence
+        over ``compress_opts`` and ``kwargs``, which also target the final
+        sweep for this method.
     inplace : bool, optional
         Whether to perform the compression inplace or not.
     kwargs
@@ -2281,7 +2638,9 @@ def tensor_network_1d_compress_srcmps_oversample(
     contract_opts = ensure_dict(contract_opts)
     contract_opts.setdefault("optimize", optimize)
 
-    compress_opts = kwargs | ensure_dict(compress_opts)
+    compress_opts = (
+        kwargs | ensure_dict(compress_opts) | ensure_dict(compress_opts_final)
+    )
 
     if max_bond is None:
         raise ValueError(
@@ -2307,6 +2666,7 @@ def tensor_network_1d_compress_srcmps_oversample(
         site_tags = tn.site_tags
     if sweep_reverse:
         site_tags = tuple(reversed(site_tags))
+    site_tags, untag_groups = parse_site_tag_groups(tn, site_tags)
 
     # yields right canonical form w.r.t site_tags
     tn = tensor_network_1d_compress_srcmps(
@@ -2326,7 +2686,7 @@ def tensor_network_1d_compress_srcmps_oversample(
         inplace=inplace,
     )
     # direct sweep in other direction
-    return _do_direct_sweep(
+    new = _do_direct_sweep(
         tn=tn,
         site_tags=site_tags,
         max_bond=max_bond,
@@ -2338,8 +2698,24 @@ def tensor_network_1d_compress_srcmps_oversample(
         compress_opts=compress_opts,
     )
 
+    untag_groups(new)
+    return new
+
 
 # ---------------------------- fitting methods ------------------------------ #
+
+
+def _conjugate_fit_update(fit_update: Tensor) -> None:
+    """Conjugate a local fit update in place.
+
+    For fermionic data, also phase every dual axis of the update. This
+    includes exposed fit bonds. It is a local adjoint, not the network-level
+    conjugation used to build the overlap.
+    """
+    if fit_update.isfermionic():
+        fit_update.modify(data=fit_update.data.conj(phase_dual=True))
+    else:
+        fit_update.conj_()
 
 
 def _tn1d_fit_sum_sweep_1site(
@@ -2361,15 +2737,6 @@ def _tn1d_fit_sum_sweep_1site(
 
     N = len(site_tags)
     K = len(tn_overlaps)
-
-    fermion = tn_fit.isfermionic()
-    if fermion and any(
-        t.data.dummy_modes for tn_o in tn_overlaps for t in tn_o
-    ):
-        warnings.warn(
-            "1-site fitting of fermionic tensor networks with tensors of odd "
-            "parity is likely incorrect, use 2-site (`bsz=2`)."
-        )
 
     if max_bond is not None:
         current_bond_dim = tn_fit.max_bond()
@@ -2461,7 +2828,7 @@ def _tn1d_fit_sum_sweep_1site(
             else:
                 tfinew += tfiknew
 
-        tfinew.conj_()
+        _conjugate_fit_update(tfinew)
 
         if compute_tdiff:
             # track change in tensor norm
@@ -2553,8 +2920,6 @@ def _tn1d_fit_sum_sweep_2site(
         right_inds = tuple(ix for ix in tfi1.inds if ix != bond)
         tfinew = None
 
-        fermion = tfi0.isfermionic()
-
         for k, tn_overlap in enumerate(tn_overlaps):
             # form local overlap
             tnik = (
@@ -2578,11 +2943,7 @@ def _tn1d_fit_sum_sweep_2site(
             else:
                 tfinew += tfiknew
 
-        if fermion:
-            # also flips the dual indices
-            tfinew.modify(data=tfinew.data.conj(phase_dual=True))
-        else:
-            tfinew.conj_()
+        _conjugate_fit_update(tfinew)
 
         tfinew0, tfinew1 = tfinew.split(
             max_bond=max_bond,
@@ -2605,12 +2966,6 @@ def _tn1d_fit_sum_sweep_2site(
         tfinew1.transpose_like_(tfi1)
         tfi0.modify(data=tfinew0.data, left_inds=tfinew0.left_inds)
         tfi1.modify(data=tfinew1.data, left_inds=tfinew1.left_inds)
-
-        if fermion:
-            # deal with the global signs generated during conjugation
-            for ts in (tfi0 | tfi1).tensors:
-                if sum(m.parity for m in ts.data.dummy_modes) % 2 == 1:
-                    ts.data.phase_global(inplace=True)
 
     return max_tdiff
 
@@ -2691,10 +3046,11 @@ def tensor_network_1d_compress_fit(
     tol : float, optional
         The convergence tolerance, in terms of local tensor distance
         normalized. If zero, there will be exactly ``max_iterations`` sweeps.
-    site_tags : sequence of str, optional
-        The tags to use to group and order the tensors from ``tn``. If not
-        given, uses ``tn.site_tags``. The tensor network built will have one
-        tensor per site, in the order given by ``site_tags``.
+    site_tags : sequence of str or tag groups, optional
+        Tags that identify and order sites. Defaults to ``tn.site_tags``.
+        Each item can group tags as described by
+        :func:`~quimb.tensor.parse_site_tag_groups`. The output has one tensor
+        per item.
     cutoff_mode : {"rsum2", "rel", ...}, optional
         The mode to use when truncating the singular values of the decomposed
         tensors. See :func:`~quimb.tensor.tensor_split`, if using the 2-site
@@ -2704,7 +3060,7 @@ def tensor_network_1d_compress_fit(
         to right, then right to left. The sequence is cycled. The final
         canonical form of the output tensor network depends on the last sweep
         direction and ``sweep_reverse``.
-    noise_dist : {"normal", "uniform", "rademacher"}, optional
+    noise_dist : {"normal", "rademacher"}, optional
         The distribution to use when generating the random sampling MPS, only
         relevant if ``tn_fit`` is not supplied.
     seed : None, int, or random generator, optional
@@ -2770,6 +3126,10 @@ def tensor_network_1d_compress_fit(
         site_tags = next(
             tn.site_tags for tn in tns if hasattr(tn, "site_tags")
         )
+    tns_to_tag = tns
+    if isinstance(tn_fit, TensorNetwork):
+        tns_to_tag = (*tns, tn_fit)
+    site_tags, untag_groups = parse_site_tag_groups(tns_to_tag, site_tags)
 
     tns = tuple(
         enforce_1d_like(tn, site_tags=site_tags, inplace=inplace) for tn in tns
@@ -2935,6 +3295,11 @@ def tensor_network_1d_compress_fit(
 
     tn_fit.drop_tags("__FIT__")
     tn_fit.conj_()
+    if tn_fit.isfermionic():
+        # correct the sign from double fermionic conjugation
+        total_dummy_parity = sum(t.data.dummy_parity for t in tn_fit)
+        t = tn_fit[site_tags[0]]
+        t.modify(data=t.data.phase_global(parity=total_dummy_parity))
 
     if normalize:
         if reverse:
@@ -2963,6 +3328,7 @@ def tensor_network_1d_compress_fit(
     elif equalize_norms:
         tn_fit.equalize_norms_(value=equalize_norms)
 
+    untag_groups(tn_fit)
     return tn_fit
 
 
@@ -3055,6 +3421,7 @@ def tensor_network_1d_compress_fit_oversample(
     sweep_reverse=False,
     equalize_norms=False,
     compress_opts=None,
+    compress_opts_final=None,
     inplace=False,
     **kwargs,
 ):
@@ -3084,11 +3451,12 @@ def tensor_network_1d_compress_fit_oversample(
         relevant if ``bsz=2``).
     bsz : {1, 2}, optional
         The block size to use for the variational fitting sweep.
-    site_tags : sequence of str, optional
-        The tags to use to group and order the tensors from ``tn``. If not
-        given, uses ``tn.site_tags``. The tensor network built will have one
-        tensor per site, in the order given by ``site_tags``.
-    noise_dist : {"normal", "uniform", "rademacher"}, optional
+    site_tags : sequence of str or tag groups, optional
+        Tags that identify and order sites. Defaults to ``tn.site_tags``.
+        Each item can group tags as described by
+        :func:`~quimb.tensor.parse_site_tag_groups`. The output has one tensor
+        per item.
+    noise_dist : {"normal", "rademacher"}, optional
         The distribution to use when generating the random sampling MPS, only
         relevant if ``tn_fit`` is not supplied.
     seed : None, int, or random generator, optional
@@ -3120,6 +3488,10 @@ def tensor_network_1d_compress_fit_oversample(
     compress_opts : dict, optional
         Supplied to :func:`~quimb.tensor.tensor_split` during the final direct
         sweep. Values set here take precedence over defaults.
+    compress_opts_final : dict, optional
+        Options for the final direct sweep. Values set here take precedence
+        over ``compress_opts`` and ``kwargs``, which also target the final
+        sweep for this method.
     kwargs
         Extra keyword arguments are combined into `compress_opts`, though
         existing items in `compress_opts` take precedence over `kwargs`.
@@ -3131,7 +3503,9 @@ def tensor_network_1d_compress_fit_oversample(
         ``site_tags[0]`` ('right canonical' form) or ``site_tags[-1]`` ('left
         canonical' form) if ``sweep_reverse``.
     """
-    compress_opts = kwargs | ensure_dict(compress_opts)
+    compress_opts = (
+        kwargs | ensure_dict(compress_opts) | ensure_dict(compress_opts_final)
+    )
 
     if max_bond is None:
         raise ValueError(
@@ -3157,6 +3531,7 @@ def tensor_network_1d_compress_fit_oversample(
         site_tags = tn.site_tags
     if sweep_reverse:
         site_tags = tuple(reversed(site_tags))
+    site_tags, untag_groups = parse_site_tag_groups(tn, site_tags)
 
     # yields right canonical form w.r.t site_tags
     tn = tensor_network_1d_compress_fit(
@@ -3178,7 +3553,7 @@ def tensor_network_1d_compress_fit_oversample(
     )
 
     # direct sweep in other direction
-    return _do_direct_sweep(
+    new = _do_direct_sweep(
         tn=tn,
         site_tags=site_tags,
         max_bond=max_bond,
@@ -3189,6 +3564,9 @@ def tensor_network_1d_compress_fit_oversample(
         permute_arrays=permute_arrays,
         compress_opts=compress_opts,
     )
+
+    untag_groups(new)
+    return new
 
 
 # ------------------------ interface to all methods ------------------------- #
@@ -3202,6 +3580,8 @@ _TN1D_COMPRESS_METHODS = {
     "zipup-oversample": tensor_network_1d_compress_zipup_oversample,
     "sdc": tensor_network_1d_compress_sdc,
     "sdc-oversample": tensor_network_1d_compress_sdc_oversample,
+    "sdcr": tensor_network_1d_compress_sdcr,
+    "sdcr-oversample": tensor_network_1d_compress_sdcr_oversample,
     "src": tensor_network_1d_compress_src,
     "src-first": tensor_network_1d_compress_src_oversample,
     "src-oversample": tensor_network_1d_compress_src_oversample,
@@ -3215,10 +3595,20 @@ _TN1D_COMPRESS_METHODS = {
 }
 
 
+_TN1D_COMPRESS_DEFAULT_CUTOFFS = {
+    # choose from compress method, svd:rand by default
+    "sdcr": "auto",
+    # these can't be used with any kind of cutoff
+    "src": 0.0,
+    "srcmps": 0.0,
+    # everything else gets default of 1e-10
+}
+
+
 def tensor_network_1d_compress(
     tn: TensorNetwork | list[TensorNetwork],
     max_bond=None,
-    cutoff=1e-10,
+    cutoff="auto",
     method="dm",
     site_tags=None,
     canonize=True,
@@ -3249,10 +3639,14 @@ def tensor_network_1d_compress(
         compressed as their sum (only supported by the 'fit' method).
     max_bond : int
         The maximum bond dimension to compress to.
-    cutoff : float, optional
+    cutoff : float or "auto", optional
         A dynamic threshold for discarding singular values when compressing.
-    method : str, optional
-        The compression method to use. The options are:
+        With ``"auto"``, use ``0.0`` for ranomized svd like methods, else
+        1e-10. For oversampling methods, this is the cutoff of the final direct
+        sweep, not the intermediate step.
+    method : str or callable, optional
+        The compression method to use. A callable is passed the same arguments
+        as a built-in 1D method. The named options are:
 
         - ``"direct"`` : direct SVD sweep.
         - ``"dm"`` : density matrix method.
@@ -3262,6 +3656,10 @@ def tensor_network_1d_compress(
         - ``"sdc"``: successive deterministic compression method.
         - ``"sdc-oversample"`` : successive deterministic compression with
           oversampling.
+        - ``"sdcr"``: successive deterministic compression, with randomized
+          rather than exact SVDs.
+        - ``"sdcr-oversample"`` : randomized successive deterministic
+          compression with oversampling.
         - ``"src"``: successive randomized compression method.
         - ``"src-first"`` or ``"src-oversample"`` : successive
           randomized compression with oversampling.
@@ -3279,10 +3677,11 @@ def tensor_network_1d_compress(
         Oversampling methods first compress to `max_bond_oversample` (typically
         chosen as 1.5 or 2x `max_bond`) using the specified method, then
         compress to `max_bond` using a direct sweep.
-    site_tags : sequence of str, optional
-        The tags to use to group and order the tensors from ``tn``. If not
-        given, uses ``tn.site_tags``. The tensor network built will have one
-        tensor per site, in the order given by ``site_tags``.
+    site_tags : sequence of str or tag groups, optional
+        Tags that identify and order sites. Defaults to ``tn.site_tags``.
+        Each item can group tags as described by
+        :func:`~quimb.tensor.parse_site_tag_groups`. The output has one tensor
+        per item.
     canonize : bool, optional
         Whether to perform canonicalization, pseudo or otherwise depending on
         the method, before compressing. Ignored for ``method='dm'`` and
@@ -3310,7 +3709,14 @@ def tensor_network_1d_compress(
     -------
     TensorNetwork
     """
-    f_tn1d = _TN1D_COMPRESS_METHODS.get(method, None)
+    if cutoff == "auto":
+        cutoff = _TN1D_COMPRESS_DEFAULT_CUTOFFS.get(method, 1e-10)
+
+    if callable(method):
+        f_tn1d = method
+    else:
+        f_tn1d = _TN1D_COMPRESS_METHODS.get(method, None)
+
     if f_tn1d is not None:
         # 1D specific compression methods
 
@@ -3468,10 +3874,11 @@ def mps_gate_with_mpo_zipup(
         The maximum bond dimension to compress to.
     cutoff : float, optional
         A dynamic threshold for discarding singular values when compressing.
-    site_tags : sequence of str, optional
-        The tags to use to group and order the tensors from ``tn``. If not
-        given, uses ``tn.site_tags``. The tensor network built will have one
-        tensor per site, in the order given by ``site_tags``.
+    site_tags : sequence of str or tag groups, optional
+        Tags that identify and order sites. Defaults to ``tn.site_tags``.
+        Each item can group tags as described by
+        :func:`~quimb.tensor.parse_site_tag_groups`. The output has one tensor
+        per item.
     canonize : bool, optional
         Whether to pseudo canonicalize the initial tensor network.
     normalize : bool, optional
@@ -3511,7 +3918,7 @@ def mps_gate_with_mpo_zipup_first(
     max_bond=None,
     max_bond_oversample=None,
     cutoff=1e-10,
-    cutoff_oversample=None,
+    cutoff_oversample="auto",
     canonize=True,
     optimize="auto-hq",
     **compress_opts,
@@ -3536,15 +3943,18 @@ def mps_gate_with_mpo_zipup_first(
     cutoff : float, optional
         The truncation error to use when performing the final regular
         compression sweep.
-    cutoff_oversample : float, optional
-        The truncation error to use when performing the zip-up compression.
+    cutoff_oversample : float or "auto", optional
+        The singular-value cutoff for the zip-up compression. With ``"auto"``,
+        use ``0.0`` for randomized SVD and ``1e-10`` for exact decompositions,
+        independently of the final sweep's ``cutoff``.
     canonize : bool, optional
         Whether to pseudo canonicalize the initial tensor network.
     optimize : str, optional
         The contraction path optimizer to use.
     compress_opts
-        Supplied to :func:`~quimb.tensor.tensor_split` (both the zip-up and
-        final sweep).
+        Supplied to :func:`tensor_network_1d_compress_zipup_oversample`.
+        Extra split options affect the intermediate zipup step. Use
+        ``compress_opts_final`` to configure the final direct sweep.
 
     Returns
     -------
