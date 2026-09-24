@@ -253,6 +253,7 @@ from .utils import (
     format_number_with_error,
     load_from_disk,
     oset,
+    parse_time_spec,
     save_to_disk,
     tree_apply,
     tree_flatten,
@@ -262,8 +263,10 @@ from .utils import (
 from .utils_plot import (
     NEUTRAL_STYLE,
     default_to_neutral_style,
+    load_progress_log,
     plot,
     plot_multi_series_zoom,
+    plot_progress_log,
 )
 
 warnings.filterwarnings("ignore", message="Caching is not available when ")
@@ -388,6 +391,7 @@ __all__ = [
     "ldmul",
     "levi_civita",
     "load_from_disk",
+    "load_progress_log",
     "log",
     "log2",
     "log10",
@@ -411,6 +415,7 @@ __all__ = [
     "num",
     "one_way_classical_information",
     "oset",
+    "parse_time_spec",
     "outer",
     "page_entropy",
     "partial_trace",
@@ -425,6 +430,7 @@ __all__ = [
     "pkron",
     "plot",
     "plot_multi_series_zoom",
+    "plot_progress_log",
     "plus",
     "prod",
     "projector",

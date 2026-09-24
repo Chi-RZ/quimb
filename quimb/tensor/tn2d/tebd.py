@@ -455,6 +455,32 @@ class TEBD2D(
         attribute.
     plot_every : int, optional
         Whether to plot the energy and energy difference every this many steps.
+    logdir : str or pathlib.Path, optional
+        If given, a directory to write the progress data to, as
+        ``"progress.json"``, so that another process can inspect and plot the
+        run while it is going, see :func:`~quimb.utils_plot.plot_progress_log`.
+        Creating a file called ``"STOP"`` in this directory then stops the run
+        gracefully, after the current sweep.
+    log_every : int or str, optional
+        How often to write the progress data, if ``logdir`` is given. Either
+        a number of sweeps, or a duration such as ``"10mins"``. Each write
+        rewrites the whole file, so raise this for very long runs or when
+        sweeps are very quick.
+    checkpoint_every : int or str, optional
+        Write ``"checkpoint.pkl"`` in ``logdir`` this often. Either a number
+        of sweeps, or a duration such as ``"10mins"``. A final checkpoint is
+        also written when :meth:`evolve` completes.
+    resume : bool, optional
+        Load ``"checkpoint.pkl"`` from ``logdir`` if present. It supplies the
+        state and evolution options. In this case, ``psi0`` and ``ham`` can be
+        omitted (supplying either gives a warning). The current init supplies
+        the callback, plotting, progress, logging, and checkpoint settings. Set
+        ``checkpoint_every`` again to continue checkpointing. If the file does
+        not exist, ``psi0`` and ``ham`` are required.
+    graceful_interrupt : bool, optional
+        Whether to intercept the first interrupt (Ctrl-C) during ``evolve``
+        and treat it as a request to stop after the current sweep. A second
+        interrupt then stops immediately, as usual.
     progbar : bool, optional
         Whether to show a progress bar during evolution.
 
@@ -489,8 +515,8 @@ class TEBD2D(
 
     def __init__(
         self,
-        psi0,
-        ham,
+        psi0=None,
+        ham=None,
         tau=0.01,
         D=None,
         cutoff=1e-10,
@@ -509,8 +535,29 @@ class TEBD2D(
         callback=None,
         keep_best=False,
         plot_every=None,
+        logdir=None,
+        log_every=1,
+        checkpoint_every=None,
+        resume=False,
+        graceful_interrupt=True,
         progbar=True,
     ):
+        if self.setup_session_opts(
+            callback=callback,
+            plot_every=plot_every,
+            logdir=logdir,
+            log_every=log_every,
+            checkpoint_every=checkpoint_every,
+            graceful_interrupt=graceful_interrupt,
+            progbar=progbar,
+            resume=resume,
+            compute_energy_fn=compute_energy_fn,
+            psi0=psi0,
+            ham=ham,
+        ):
+            # the checkpoint supplies the full run state
+            return
+
         self.setup_sweep_opts(
             psi0,
             ham,
@@ -520,10 +567,7 @@ class TEBD2D(
             second_order_reflect=second_order_reflect,
             tol=tol,
             tol_energy_diff=tol_energy_diff,
-            callback=callback,
             keep_best=keep_best,
-            plot_every=plot_every,
-            progbar=progbar,
         )
         self.setup_gate_opts(
             D=D,
@@ -624,6 +668,32 @@ class SimpleUpdate(
         attribute.
     plot_every : int, optional
         Whether to plot the energy and energy difference every this many steps.
+    logdir : str or pathlib.Path, optional
+        If given, a directory to write the progress data to, as
+        ``"progress.json"``, so that another process can inspect and plot the
+        run while it is going, see :func:`~quimb.utils_plot.plot_progress_log`.
+        Creating a file called ``"STOP"`` in this directory then stops the run
+        gracefully, after the current sweep.
+    log_every : int or str, optional
+        How often to write the progress data, if ``logdir`` is given. Either
+        a number of sweeps, or a duration such as ``"10mins"``. Each write
+        rewrites the whole file, so raise this for very long runs or when
+        sweeps are very quick.
+    checkpoint_every : int or str, optional
+        Write ``"checkpoint.pkl"`` in ``logdir`` this often. Either a number
+        of sweeps, or a duration such as ``"10mins"``. A final checkpoint is
+        also written when :meth:`evolve` completes.
+    resume : bool, optional
+        Load ``"checkpoint.pkl"`` from ``logdir`` if present. It supplies the
+        state and evolution options. In this case, ``psi0`` and ``ham`` can be
+        omitted (supplying either gives a warning). This call supplies the
+        callback, plotting, progress, logging, and checkpoint settings. Set
+        ``checkpoint_every`` again to continue checkpointing. If the file does
+        not exist, ``psi0`` and ``ham`` are required.
+    graceful_interrupt : bool, optional
+        Whether to intercept the first interrupt (Ctrl-C) during ``evolve``
+        and treat it as a request to stop after the current sweep. A second
+        interrupt then stops immediately, as usual.
     progbar : bool, optional
         Whether to show a progress bar during evolution.
 
@@ -666,8 +736,8 @@ class SimpleUpdate(
 
     def __init__(
         self,
-        psi0: PEPS,
-        ham: LocalHam2D,
+        psi0: PEPS = None,
+        ham: LocalHam2D = None,
         tau=0.01,
         D=None,
         chi=None,
@@ -692,8 +762,29 @@ class SimpleUpdate(
         callback=None,
         keep_best=False,
         plot_every=None,
+        logdir=None,
+        log_every=1,
+        checkpoint_every=None,
+        resume=False,
+        graceful_interrupt=True,
         progbar=True,
     ):
+        if self.setup_session_opts(
+            callback=callback,
+            plot_every=plot_every,
+            logdir=logdir,
+            log_every=log_every,
+            checkpoint_every=checkpoint_every,
+            graceful_interrupt=graceful_interrupt,
+            progbar=progbar,
+            resume=resume,
+            compute_energy_fn=compute_energy_fn,
+            psi0=psi0,
+            ham=ham,
+        ):
+            # the checkpoint supplies the full run state
+            return
+
         self.setup_sweep_opts(
             psi0,
             ham,
@@ -703,10 +794,7 @@ class SimpleUpdate(
             second_order_reflect=second_order_reflect,
             tol=tol,
             tol_energy_diff=tol_energy_diff,
-            callback=callback,
             keep_best=keep_best,
-            plot_every=plot_every,
-            progbar=progbar,
         )
         self.setup_gate_opts(
             D=D,
@@ -1279,7 +1367,7 @@ class FullUpdate(TEBD2D):
         return self.state.compute_local_expectation(
             self.ham.terms,
             plaquette_envs=self.plaquette_envs,
-            plaquette_mapping=self.plaquette_mapping,
+            plaquette_map=self.plaquette_mapping,
             **self.compute_energy_opts,
         )
 
