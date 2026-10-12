@@ -34,8 +34,28 @@ def execute_symbolically(plan, blocks):
     return outputs, peak_cache
 
 
+class TestCompressedEnvironmentOptions:
+    @pytest.mark.parametrize("layer_tags", [False, True, 0, 1])
+    def test_rejects_boolean_layer_tags(self, layer_tags):
+        import quimb.tensor as qtn
+        from quimb.tensor.environments import gen_compressed_environments
+
+        norm = qtn.PEPS.rand(2, 2, 2, seed=42).make_norm()
+        with pytest.raises(TypeError, match="existing tensor network"):
+            list(
+                gen_compressed_environments(
+                    norm,
+                    ("X0", "X1"),
+                    ("Y0", "Y1"),
+                    (),
+                    max_bond=4,
+                    layer_tags=layer_tags,
+                )
+            )
+
+
 class TestEnvironmentPlan:
-    @pytest.mark.parametrize("schedule", ["tree", "cut"])
+    @pytest.mark.parametrize("schedule", ["tree", "cut", "cutpair"])
     @pytest.mark.parametrize("cyclic", [False, True])
     def test_all_blocks(self, cyclic, schedule):
         for L in range(1, 12):
@@ -60,7 +80,7 @@ class TestEnvironmentPlan:
                     assert set(represented) == set(range(L)) - block
                     assert len(represented) == L - block_size
 
-    @pytest.mark.parametrize("schedule", ["tree", "cut"])
+    @pytest.mark.parametrize("schedule", ["tree", "cut", "cutpair"])
     def test_selected_blocks(self, schedule):
         plan = EnvironmentPlan(10, schedule=schedule)
         blocks = [(8, 2), (2, 2), (5, 2), (2, 2)]
@@ -88,7 +108,7 @@ class TestEnvironmentPlan:
         with pytest.raises(ValueError):
             all_blocks(4, 5)
 
-    @pytest.mark.parametrize("schedule", ["tree", "cut"])
+    @pytest.mark.parametrize("schedule", ["tree", "cut", "cutpair"])
     @pytest.mark.parametrize("cyclic", [False, True])
     def test_mixed_blocks(self, cyclic, schedule):
         for L in range(1, 10):
@@ -115,7 +135,7 @@ class TestEnvironmentPlan:
                 assert set(represented) == set(range(L)) - block
                 assert len(represented) == L - size
 
-    @pytest.mark.parametrize("schedule", ["tree", "cut"])
+    @pytest.mark.parametrize("schedule", ["tree", "cut", "cutpair"])
     def test_mixed_blocks_share_work(self, schedule):
         L = 32
         blocks = [(start, size) for size in (1, 2) for start in range(L)]
@@ -151,6 +171,26 @@ class TestEnvironmentPlan:
             _, peak_cache = execute_symbolically(plan, blocks)
             assert peak_cache <= L
 
+    def test_cutpair_schedule_scaling(self):
+        for L in (8, 16, 32, 64):
+            plan = EnvironmentPlan(L, schedule="cutpair")
+            moves = plan.get_moves(all_blocks(L, 1))
+            nconstruct = sum(
+                move.kind in ("init", "contract") for move in moves
+            )
+            assert nconstruct <= 2 * L
+            # the two sides of the cut are kept separate
+            assert not any(
+                len(move.input_envs) == 2
+                for move in moves
+                if move.kind == "contract"
+            )
+            assert any(
+                len(move.input_envs) == 2
+                for move in moves
+                if move.kind == "output"
+            )
+
     def test_cut_schedule_scaling(self):
         for L in (8, 16, 32, 64):
             plan = EnvironmentPlan(L, schedule="cut")
@@ -164,12 +204,18 @@ class TestEnvironmentPlan:
                 for move in moves
                 if move.kind == "contract"
             )
+            assert all(
+                len(move.input_envs) == 1
+                for move in moves
+                if move.kind == "output"
+            )
 
+    @pytest.mark.parametrize("schedule", ["cut", "cutpair"])
     @pytest.mark.parametrize("block_size", [1, 2, 5])
-    def test_cut_single_start(self, block_size):
+    def test_cut_single_start(self, block_size, schedule):
         L = 32
         for start in (0, 7, L - block_size, L - 1):
-            plan = EnvironmentPlan(L, schedule="cut")
+            plan = EnvironmentPlan(L, schedule=schedule)
             moves = plan.get_moves([(start, block_size)])
             nsite = sum(len(move.input_sites) for move in moves)
             nmerge = sum(
@@ -179,11 +225,13 @@ class TestEnvironmentPlan:
             assert nsite == L - block_size
             assert nmerge <= 1
 
-    def test_cut_selected_starts_and_streaming(self):
-        plan = EnvironmentPlan(32, schedule="cut")
+    @pytest.mark.parametrize("schedule", ["cut", "cutpair"])
+    def test_cut_selected_starts_and_streaming(self, schedule):
+        plan = EnvironmentPlan(32, schedule=schedule)
         moves = plan.get_moves([(1, 2)], include_deletes=False)
         nconstruct = sum(move.kind in ("init", "contract") for move in moves)
-        assert nconstruct == 31
+        # one move per site outside the block, plus any merge
+        assert nconstruct == (31 if schedule == "cut" else 30)
 
         blocks = [(0, 2), (1, 2)]
         moves = plan.get_moves(blocks, include_deletes=False)
@@ -196,7 +244,7 @@ class TestEnvironmentPlan:
         )
 
     def test_show(self, capsys):
-        EnvironmentPlan(4, schedule="cut").show(
+        EnvironmentPlan(4, schedule="cutpair").show(
             [(0, 1)], include_deletes=False
         )
         printed = capsys.readouterr().out
@@ -205,7 +253,7 @@ class TestEnvironmentPlan:
         assert "output" in printed
         assert " B " in printed
 
-    @pytest.mark.parametrize("schedule", ["tree", "cut"])
+    @pytest.mark.parametrize("schedule", ["tree", "cut", "cutpair"])
     def test_environment_keys_are_intervals(self, schedule):
         plan = EnvironmentPlan(8, schedule=schedule)
         moves = plan.get_moves(all_blocks(8, 2))

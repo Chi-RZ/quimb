@@ -93,12 +93,14 @@ from .fitting import (
     tensor_network_fit_tree,
 )
 from .networking import (
+    SweepScheduler,
     compute_centralities,
     compute_hierarchical_grouping,
     compute_hierarchical_linkage,
     compute_hierarchical_ordering,
     compute_hierarchical_ssa_path,
     compute_shortest_distances,
+    compute_sweep_ranks,
     connected_bipartitions,
     gen_all_paths_between_tids,
     gen_gloops,
@@ -150,6 +152,24 @@ def tags_to_oset(tags):
         return tags.copy()
     else:
         return oset(tags)
+
+
+def parse_layer_tags(layer_tags, *, create=False):
+    """Resolve a ``layer_tags`` option. With ``create=True``, for methods that
+    build the ket and bra layers, map ``True`` or ``1`` to ``("KET", "BRA")``
+    and ``False`` or ``0`` to ``None``. Otherwise, for methods taking an
+    existing network, raise ``TypeError`` for these, since the tags must
+    already be present. Return any other value unchanged.
+    """
+    if isinstance(layer_tags, (Integral, np.bool_)) and layer_tags in (0, 1):
+        if not create:
+            raise TypeError(
+                f"layer_tags={layer_tags} cannot choose tags for an existing "
+                "tensor network. Use None to contract layers together, or "
+                "supply the layer tag names explicitly."
+            )
+        return ("KET", "BRA") if layer_tags else None
+    return layer_tags
 
 
 def parse_site_tag_groups(tn, site_tags, tag_id="__GST{}__"):
@@ -1998,6 +2018,26 @@ def maybe_unwrap(
     return result
 
 
+def get_inner_dummy_labels(tensors):
+    """Get the labels of the fermionic dummy modes that are paired within
+    ``tensors``. These are 'inner bonds', and thus not phased like dual outer
+    legs.
+
+    Parameters
+    ----------
+    tensors : TensorNetwork or sequence of Tensor
+        The tensors to check.
+
+    Returns
+    -------
+    set
+    """
+    counts = collections.Counter(
+        m.label for t in tensors if t.isfermionic() for m in t.data.dummy_modes
+    )
+    return {label for label, count in counts.items() if count > 1}
+
+
 # --------------------------------------------------------------------------- #
 #                                Tensor Class                                 #
 # --------------------------------------------------------------------------- #
@@ -2735,7 +2775,7 @@ class Tensor:
         new_ind_pair_diag, inplace=True
     )
 
-    def conj(self, inplace=False, output_inds=None):
+    def conj(self, inplace=False, output_inds=None, inner_dummy_labels=()):
         """Conjugate this tensor's data without changing its indices.
 
         Parameters
@@ -2745,27 +2785,43 @@ class Tensor:
         output_inds : sequence of str, optional
             Only matters if this tensor is fermionic. If so, which indices to
             consider as 'outer' indices of a global network, if any of those
-            are non-dual, the corresponding axes are phase-flipped to give the
+            are dual, the corresponding axes are phase-flipped to give the
             correct local fermionic signs. Unlike `TensorNetwork.conj`, no
-            indices are automatically inferred.
+            indices are automatically inferred. If given, even if empty, the
+            dummy modes of odd parity fermionic arrays are also treated as
+            outer legs, and phased in the same way, unless listed in
+            ``inner_dummy_labels``.
+        inner_dummy_labels : collection, optional
+            Only matters if this tensor is fermionic. Labels of dummy modes
+            whose conjugate partner is elsewhere in the network, see
+            :func:`get_inner_dummy_labels`. Like inner bonds, these get no
+            phase. They are relabelled, so that the conjugate network can be
+            combined with the original.
 
         Returns
         -------
         Tensor
         """
         t = self if inplace else self.copy()
-        t.modify(apply=conj, left_inds=t.left_inds)
 
-        if output_inds and t.isfermionic():
-            data = t.data
-            axs = tuple(
-                ax
-                for ax, ix in enumerate(t.inds)
-                if (ix in output_inds) and not data.indices[ax].dual
+        if not t.isfermionic():
+            t.modify(apply=conj, left_inds=t.left_inds)
+            return t
+
+        if output_inds is None:
+            phase_dual = False
+        else:
+            phase_dual = tuple(
+                ax for ax, ix in enumerate(t.inds) if ix in output_inds
             )
-            if axs:
-                t.modify(data=data.phase_flip(*axs))
 
+        t.modify(
+            data=t.data.conj(
+                phase_dual=phase_dual,
+                inner_dummy_labels=inner_dummy_labels,
+            ),
+            left_inds=t.left_inds,
+        )
         return t
 
     conj_ = functools.partialmethod(conj, inplace=True)
@@ -4601,14 +4657,21 @@ class TensorNetwork:
         self._link_inds(new - old, tid)
 
     @property
-    def num_tensors(self):
+    def num_tensors(self) -> int:
         """The total number of tensors in the tensor network."""
         return len(self.tensor_map)
 
     @property
-    def num_indices(self):
+    def num_indices(self) -> int:
         """The total number of indices in the tensor network."""
         return len(self.ind_map)
+
+    @property
+    def num_bonds(self) -> int:
+        """The total number of inner indices. 'Inner' here is simply defined as
+        any index which appear on more than one tensor.
+        """
+        return len(self._inner_inds)
 
     def pop_tensor(self, tid_or_tags, which="all") -> Tensor:
         """Remove a tensor from this network, and return it.
@@ -4881,7 +4944,10 @@ class TensorNetwork:
             If the tensor data is fermionic, whether to phase flip any dual
             outer indices, to ensure the correct behavior when forming local
             cluster states. By default ``True``. See `output_inds` for which
-            indices are considered outer.
+            indices are considered outer. Dummy modes of odd parity arrays are
+            treated as outer legs too, unless their conjugate partner is in
+            this network. Such paired dummy modes are always relabelled, so
+            that the conjugate network can be combined with the original.
         inplace : bool, optional
             Whether to perform the conjugation inplace or not.
 
@@ -4900,8 +4966,16 @@ class TensorNetwork:
         else:
             phase_inds = None
 
+        if tn.isfermionic():
+            inner_dummy_labels = get_inner_dummy_labels(tn)
+        else:
+            inner_dummy_labels = ()
+
         for t in tn:
-            t.conj_(output_inds=phase_inds)
+            t.conj_(
+                output_inds=phase_inds,
+                inner_dummy_labels=inner_dummy_labels,
+            )
 
         if mangle_inner:
             append = None if mangle_inner is True else str(mangle_inner)
@@ -4953,8 +5027,10 @@ class TensorNetwork:
         ----------
         mangle_append : {str, False or None}, optional
             How to mangle the inner indices of the bra.
-        layer_tags : (str, str), optional
-            The tags to identify the top and bottom.
+        layer_tags : None, bool, int or tuple[str, str], optional
+            Tags for the ket and bra layers, in that order. Use ``True`` or
+            ``1`` for ``("KET", "BRA")``, or ``False``, ``0`` or ``None`` for
+            no layer tags.
         output_inds : sequence of str, optional
             If given, the indices to mangle will be restricted to those not in
             this list. This is only needed for (hyper) tensor networks where
@@ -4967,6 +5043,7 @@ class TensorNetwork:
         -------
         tn_norm : TensorNetwork
         """
+        layer_tags = parse_layer_tags(layer_tags, create=True)
         ket = self.copy()
 
         if layer_tags:
@@ -5063,8 +5140,10 @@ class TensorNetwork:
             outer indices as this tensor network, all other indices will be
             explicitly mangled in the copy taken, allowing 'hyper' overlaps.
             This tensor network will be conjugated in the overlap.
-        layer_tags : (str, str), optional
-            The tags to identify the top and bottom.
+        layer_tags : None, bool, int or tuple[str, str], optional
+            Tags for the ket and bra layers, in that order. Use ``True`` or
+            ``1`` for ``("KET", "BRA")``, or ``False``, ``0`` or ``None`` for
+            no layer tags.
         output_inds : sequence of str, optional
             If given, the indices to mangle will be restricted to those not in
             this list. This is only needed for (hyper) tensor networks where
@@ -5077,6 +5156,7 @@ class TensorNetwork:
         -------
         tn_overlap : TensorNetwork
         """
+        layer_tags = parse_layer_tags(layer_tags, create=True)
         ket = self.copy()
         if layer_tags:
             ket.add_tag(layer_tags[0])
@@ -7799,23 +7879,20 @@ class TensorNetwork:
         fuse_multibonds=True,
         equalize_norms=False,
         touched_tids=None,
+        sweep_order="auto",
         info=None,
         progbar=False,
         reduce_opts=None,
         compress_opts=None,
         inplace=False,
     ):
-        """Iterative gauge all the bonds in this tensor network with a 'simple
-        update' like strategy. If gauges are not supplied they are initialized
-        and then reabsorbed at the end, in which case this method acts as a
-        kind of conditioning. More usefully, if you supply `gauges` then they
-        will be updated inplace and *not* absorbed back into the tensor
-        network, with the assumption that you are using/tracking them
-        externally.
+        """Gauge all bonds with iterative 'simple update' steps. Supplied
+        ``gauges`` are updated in place and kept separate from the network.
+        Otherwise, initialize gauges and absorb them at the end to condition
+        the network.
 
-        Note the default settings perform a small number of iterations
-        sufficient for conditioning a network, but not converging to a fixed
-        point suitable for cluster calculations for example.
+        The default few iterations condition the network. For cluster
+        calculations, use enough iterations to converge the gauges.
 
         Parameters
         ----------
@@ -7833,13 +7910,18 @@ class TensorNetwork:
         gauges : dict, optional
             Supply the initial gauges to use.
         fuse_multibonds : bool, optional
-            Whether to fuse multibonds before gauging, this is usually
-            desirable unless you want to explicitly retain the exact
-            multi-index structure.
+            Fuse bonds between the same tensors. Usually helpful unless you
+            need to keep these indices separate.
         equalize_norms : bool, optional
             Whether to equalize the norms of the tensors after each update.
         touched_tids : sequence of int, optional
-            The tensor identifiers to start the gauge sweep from.
+            Tensor ids to start from. Initially mark only their bonds for
+            update. Start the breadth first search from the first tensor.
+        sweep_order : {'auto', 'alternate', 'fixed'}, optional
+            Bond update order. Use 'alternate' to reverse each sweep, starting
+            reversed, or 'fixed' to keep the same order. With 'auto',
+            alternate on graphs with no loops, else use a fixed order.
+            See :class:`.SweepScheduler`.
         info : dict, optional
             Store extra information about the gauging process in this dict.
             The following keys are filled:
@@ -7870,32 +7952,61 @@ class TensorNetwork:
         """
         tn = self if inplace else self.copy()
 
-        # the vector 'gauges' that will live on the bonds
         gauges_supplied = gauges is not None
         if not gauges_supplied:
             gauges = {}
 
-        # we store the actual ("conditioned") vectors treated as the
-        # environments separately from the 'exact' gauges
+        # keep conditioned environments separate from raw gauges
         gauges_conditioned = {}
-        # if damping we need to mark if we have updated gauge specifically
+        # track which conditioned gauges are current
         have_conditioned = set()
 
         if info is None:
             info = {}
-        # tensor_gauge_simple_bond accrues the log10 of each stripped gauge
-        # norm into "exponent" - seed it so the scaling is tracked
+        # tensor_gauge_simple_bond adds log10 of removed gauge norms here
         info["exponent"] = 0.0
 
-        # keep track of which indices are available to be updated
         if touched_tids is not None:
-            # use indices adjacent to the given tensors
-            next_touched = oset(
+            touched = oset(
                 ix for tid in touched_tids for ix in tn.tensor_map[tid].inds
             )
         else:
-            # use all indices
-            next_touched = oset(tn._inner_inds)
+            touched = oset(tn._inner_inds)
+
+        check_opt("sweep_order", sweep_order, ("auto", "alternate", "fixed"))
+        if sweep_order == "auto" and touched_tids is not None:
+            # check beyond the scheduler's initial region
+            is_tree = (
+                # short-cut (anything with num_bonds >= num_tensors is loopy)
+                (tn.num_bonds < tn.num_tensors)
+                # else must check inverse explictly due to disconnected tensors
+                and (
+                    compute_sweep_ranks(
+                        nodes=tn.tensor_map,
+                        edges=[
+                            tuple(tids)
+                            for tids in map(tn.ind_map.get, tn._inner_inds)
+                            if len(tids) == 2
+                        ],
+                    )[1]
+                )
+            )
+            sweep_order = "alternate" if is_tree else "fixed"
+
+        # rank bonds outwards from touched tensors, skipping hyper indices
+        bond_tid_pairs = [
+            tuple(tids)
+            for tids in map(tn.ind_map.get, touched)
+            if len(tids) == 2
+        ]
+        sweeper = SweepScheduler(
+            nodes=(*(touched_tids or ()), *concat(bond_tid_pairs)),
+            edges=bond_tid_pairs,
+            # fused bonds may have been removed from ind_map
+            key_to_nodes=lambda ix: tn.ind_map.get(ix, ()),
+            sweep_order=sweep_order,
+        )
+        sweeper.touch(touched)
 
         if progbar:
             import tqdm
@@ -7909,22 +8020,15 @@ class TensorNetwork:
         compute_diff = (tol > 0.0) or (pbar is not None)
 
         while unconverged and it < max_iterations:
-            # seeding "max_sdiff" tells tensor_gauge_simple_bond to track the
-            # running maximum diff here (and can only converge if tol > 0.0)
+            # initialize max_sdiff so tensor_gauge_simple_bond tracks changes
             if compute_diff:
                 info["max_sdiff"] = -1.0
 
-            touched, next_touched = next_touched, oset()
-            # add an arbitrary index to start the sweep
-            queue = oset([touched.popleft()])
-
-            while queue:
-                bond_ind = queue.popleft()
-
+            for bond_ind in sweeper.sweep():
                 try:
                     tida, tidb = tn.ind_map[bond_ind]
                 except (KeyError, ValueError):
-                    # fused multibond (removed) or not a bond (len(tids != 2))
+                    # removed bond or index not shared by exactly two tensors
                     continue
 
                 ta = tn.tensor_map[tida]
@@ -7948,29 +8052,20 @@ class TensorNetwork:
                 )
 
                 if equalize_norms:
-                    # the norms of the tensors are not kept under control by
-                    # the the orthogonalization because of the inverse gauge
-                    # application above, so explicitly equalize here
+                    # inverse gauges can change tensor norms
                     tn.strip_exponent(tida)
                     tn.strip_exponent(tidb)
 
-                # mark conditioned version as out-of-date (note we still retain
-                # the old version in gauge_conditioned for possible damping)
+                # keep old conditioned gauge for damping, but mark it outdated
                 have_conditioned.discard(bond_ind)
                 has_changed = (tol == 0.0) or (info["sdiff"] > tol)
                 if has_changed:
-                    # mark index and neighbors as touched for next sweep
-                    next_touched.add(bond_ind)
-
-                for neighbor_ind in tn._get_neighbor_inds(bond_ind):
-                    if neighbor_ind in tn._inner_inds:
-                        if neighbor_ind in touched:
-                            # move into queue
-                            touched.remove(neighbor_ind)
-                            queue.add(neighbor_ind)
-                        if has_changed:
-                            # mark as touched for next sweep
-                            next_touched.add(neighbor_ind)
+                    # update neighbors, joining this sweep if possible
+                    sweeper.touch(
+                        ix
+                        for ix in tn._get_neighbor_inds(bond_ind)
+                        if ix in tn._inner_inds
+                    )
 
             if pbar is not None:
                 pbar.update()
@@ -7982,13 +8077,11 @@ class TensorNetwork:
             unconverged = (tol == 0.0) or (info["max_sdiff"] > tol)
             it += 1
 
-        # pop the accrued scale back out - it is redistributed into the network
-        # below, not left as a pending exponent for the caller to apply
+        # apply accumulated scale to the network
         nfact = info.pop("exponent")
         if equalize_norms:
             tn.exponent += nfact
         else:
-            # redistribute the accrued scaling
             tn.multiply_each_(10 ** (nfact / tn.num_tensors))
 
         if not gauges_supplied:
@@ -10357,7 +10450,8 @@ class TensorNetwork:
         calculated by `bonds` called on the two regions. The left projector
         should have shape ``(d, new_bond_dim)`` and the right projector shape
         ``(new_bond_dim, d)``, where ``d`` is the product of the respective
-        index dimensions.
+        index dimensions. The projectors can also be supplied unfused, with
+        one axis per index instead of the single fused axis.
 
         Parameters
         ----------
@@ -10367,10 +10461,12 @@ class TensorNetwork:
             The tags of the tensors in the right region.
         Pl : array_like
             The left projector, with the fused original bonds as its first
-            dimension and the new bond as its second dimension.
+            dimension and the new bond as its second dimension, or unfused
+            with one axis per index in ``left_inds`` and then the new bond.
         Pr : array_like
             The right projector, with the new bond as its first dimension and
-            the fused original bonds as its second dimension.
+            the fused original bonds as its second dimension, or unfused with
+            the new bond and then one axis per index in ``right_inds``.
         left_inds : sequence of str, optional
             The ordered indices of the left region to connect to the left
             projector, `Pl`. Calculated automatically as the bonds connecting
@@ -10428,8 +10524,11 @@ class TensorNetwork:
         if bond_ind is None:
             bond_ind = rand_uuid()
 
-        Pl = unfuse(Pl, axis=0, axis_dims=left_dims)
-        Pr = unfuse(Pr, axis=1, axis_dims=right_dims)
+        # projectors with one axis per index are already unfused
+        if do("ndim", Pl) == 2:
+            Pl = unfuse(Pl, axis=0, axis_dims=left_dims)
+        if do("ndim", Pr) == 2:
+            Pr = unfuse(Pr, axis=1, axis_dims=right_dims)
 
         # cut the original bonds
         new_lix = [rand_uuid() for _ in left_inds]
@@ -10612,6 +10711,10 @@ class TensorNetwork:
                 contract_opts=contract_opts,
                 reduce_opts=reduce_opts,
             )
+
+            # unfuse here for max compat with block sparse array
+            Rl = unfuse(Rl, axis=1, axis_dims=bix_sizes)
+            Rr = unfuse(Rr, axis=0, axis_dims=bix_sizes)
 
             # then form the 'oblique' projectors
             Pl, Pr = compute_oblique_projectors(Rl, Rr, **compress_opts)
@@ -12923,7 +13026,7 @@ class PTensor(Tensor):
         """
         self._data.add_function(fn)
 
-    def conj(self, inplace=False, output_inds=None):
+    def conj(self, inplace=False, output_inds=None, inner_dummy_labels=()):
         """Conjugate this parametrized tensor lazily.
 
         Parameters
@@ -12934,6 +13037,8 @@ class PTensor(Tensor):
             Indices to treat as outputs when applying fermionic conjugation
             phases. Fermionic output phases are not supported for parametrized
             tensors.
+        inner_dummy_labels : collection, optional
+            Unused, since fermionic output phases are not supported.
         """
         if output_inds and self.isfermionic():
             raise NotImplementedError(

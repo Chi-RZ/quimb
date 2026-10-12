@@ -29,6 +29,7 @@ from ..tensor_core import (
     bonds,
     bonds_size,
     oset,
+    parse_layer_tags,
     parse_site_tag_groups,
     rand_uuid,
     tags_to_oset,
@@ -38,7 +39,10 @@ from ..tnag.core import (
     TensorNetworkGen,
     TensorNetworkGenOperator,
     TensorNetworkGenVector,
+    _compute_expecs_maybe_in_parallel,
+    contract_reduced_density_matrix,
     expectations_from_rhos,
+    get_bra_inds,
     partial_traces_from_environment,
     tensor_network_ag_sum,
 )
@@ -1294,17 +1298,25 @@ class TensorNetwork2D(TensorNetworkGen):
         layer_tags=None,
         **compress_opts,
     ):
-        from quimb.tensor.tn1d.compress import tensor_network_1d_compress
-
         r2d = Rotator2D(self, xrange, yrange, from_which)
         site_tag = r2d.site_tag
         istep = r2d.istep
+
+        if r2d.cyclic_y:
+            # keep the periodic boundary as a ring
+            from quimb.tensor.tnag.compress import (
+                tensor_network_ag_compress as compress,
+            )
+        else:
+            from quimb.tensor.tn1d.compress import (
+                tensor_network_1d_compress as compress,
+            )
 
         def _do_compress(site_tags):
             site_tags, untag_groups = parse_site_tag_groups(self, site_tags)
             tn_boundary = self.partition(site_tags, inplace=True)[1]
 
-            tensor_network_1d_compress(
+            compress(
                 tn_boundary,
                 max_bond=max_bond,
                 cutoff=cutoff,
@@ -1785,8 +1797,10 @@ class TensorNetwork2D(TensorNetworkGen):
         default), ``'full-bond'``, ``'projector2d'`` or any 1D compression
         method, see
         :func:`~quimb.tensor.tn1d.compress.tensor_network_1d_compress`.
-        ``mode`` is a deprecated alias of ``method``.
+        ``mode`` is a deprecated alias of ``method``. For ``layer_tags``,
+        see :meth:`contract_boundary`.
         """
+        layer_tags = parse_layer_tags(layer_tags)
         method = _parse_boundary_method(method, contract_boundary_opts)
 
         tn = self if inplace else self.copy()
@@ -1863,7 +1877,7 @@ class TensorNetwork2D(TensorNetworkGen):
             >──●══●══●══●  -->  >──>──●══●══●  -->  >──>──>──●══●
             .  .           -->     .  .        -->        .  .
 
-        If ``layer_tags`` is specified, each then each layer is contracted in
+        If ``layer_tags`` is supplied, each layer is contracted in
         and compressed separately, resulting generally in a lower memory
         scaling. For two layer tags this looks like::
 
@@ -1904,12 +1918,10 @@ class TensorNetwork2D(TensorNetworkGen):
             Whether to sweep one way with canonization before compressing.
         method : {'mps', 'full-bond', ...}, optional
             How to perform the compression on the boundary.
-        layer_tags : None or sequence[str], optional
-            If ``None``, all tensors at each coordinate pair
-            ``[(i, j), (i + 1, j)]`` will be first contracted. If specified,
-            then the outer tensor at ``(i, j)`` will be contracted with the
-            tensor specified by ``[(i + 1, j), layer_tag]``, for each
-            ``layer_tag`` in ``layer_tags``.
+        layer_tags : None or sequence of str, optional
+            Tags identifying the layers, which are contracted one by one
+            in this order. Use ``None`` to contract all layers together.
+            Booleans and integers are not accepted.
         sweep_reverse : bool, optional
             Which way to perform the compression sweep, which has an effect on
             which tensors end up being canonized. Setting this to true sweeps
@@ -1981,7 +1993,7 @@ class TensorNetwork2D(TensorNetworkGen):
             |  |  |  |  |  -->  |  |  |  |  |  -->  |  |  |  |  |
             .  .           -->     .  .        -->        .  .
 
-        If ``layer_tags`` is specified, each then each layer is contracted in
+        If ``layer_tags`` is supplied, each layer is contracted in
         and compressed separately, resulting generally in a lower memory
         scaling. For two layer tags this looks like::
 
@@ -2022,12 +2034,10 @@ class TensorNetwork2D(TensorNetworkGen):
             Whether to sweep one way with canonization before compressing.
         method : {'mps', 'full-bond', ...}, optional
             How to perform the compression on the boundary.
-        layer_tags : None or str, optional
-            If ``None``, all tensors at each coordinate pair
-            ``[(i, j), (i - 1, j)]`` will be first contracted. If specified,
-            then the outer tensor at ``(i, j)`` will be contracted with the
-            tensor specified by ``[(i - 1, j), layer_tag]``, for each
-            ``layer_tag`` in ``layer_tags``.
+        layer_tags : None or sequence of str, optional
+            Tags identifying the layers, which are contracted one by one
+            in this order. Use ``None`` to contract all layers together.
+            Booleans and integers are not accepted.
         sweep_reverse : bool, optional
             Which way to perform the compression sweep, which has an effect on
             which tensors end up being canonized. Setting this to true sweeps
@@ -2105,7 +2115,7 @@ class TensorNetwork2D(TensorNetworkGen):
             ║         │
             ●──       ^──
 
-        If ``layer_tags`` is specified, each then each layer is contracted in
+        If ``layer_tags`` is supplied, each layer is contracted in
         and compressed separately, resulting generally in a lower memory
         scaling. For two layer tags this looks like::
 
@@ -2157,12 +2167,10 @@ class TensorNetwork2D(TensorNetworkGen):
             Whether to sweep one way with canonization before compressing.
         method : {'mps', 'full-bond', ...}, optional
             How to perform the compression on the boundary.
-        layer_tags : None or str, optional
-            If ``None``, all tensors at each coordinate pair
-            ``[(i, j), (i, j + 1)]`` will be first contracted. If specified,
-            then the outer tensor at ``(i, j)`` will be contracted with the
-            tensor specified by ``[(i + 1, j), layer_tag]``, for each
-            ``layer_tag`` in ``layer_tags``.
+        layer_tags : None or sequence of str, optional
+            Tags identifying the layers, which are contracted one by one
+            in this order. Use ``None`` to contract all layers together.
+            Booleans and integers are not accepted.
         sweep_reverse : bool, optional
             Which way to perform the compression sweep, which has an effect on
             which tensors end up being canonized. Setting this to true sweeps
@@ -2240,7 +2248,7 @@ class TensorNetwork2D(TensorNetworkGen):
               ║         │
             ──●       ──^
 
-        If ``layer_tags`` is specified, each then each layer is contracted in
+        If ``layer_tags`` is supplied, each layer is contracted in
         and compressed separately, resulting generally in a lower memory
         scaling. For two layer tags this looks like::
 
@@ -2291,12 +2299,10 @@ class TensorNetwork2D(TensorNetworkGen):
             Whether to sweep one way with canonization before compressing.
         method : {'mps', 'full-bond', ...}, optional
             How to perform the compression on the boundary.
-        layer_tags : None or str, optional
-            If ``None``, all tensors at each coordinate pair
-            ``[(i, j), (i, j - 1)]`` will be first contracted. If specified,
-            then the outer tensor at ``(i, j)`` will be contracted with the
-            tensor specified by ``[(i + 1, j), layer_tag]``, for each
-            ``layer_tag`` in ``layer_tags``.
+        layer_tags : None or sequence of str, optional
+            Tags identifying the layers, which are contracted one by one
+            in this order. Use ``None`` to contract all layers together.
+            Booleans and integers are not accepted.
         sweep_reverse : bool, optional
             Which way to perform the compression sweep, which has an effect on
             which tensors end up being canonized. Setting this to true sweeps
@@ -2357,6 +2363,7 @@ class TensorNetwork2D(TensorNetworkGen):
         tn = self if inplace else self.copy()
 
         contract_boundary_opts = ensure_dict(contract_boundary_opts)
+        parse_layer_tags(contract_boundary_opts.get("layer_tags"))
 
         if equalize_norms == "auto":
             # if we are going to extract exponent at end, assume we
@@ -2396,16 +2403,21 @@ class TensorNetwork2D(TensorNetworkGen):
             if sequence is None:
                 sequence = ("xmin", "xmax", "ymin", "ymax")
 
-            target_xmin = min(x[0] for x in around)
-            target_xmax = max(x[0] for x in around)
-            target_ymin = min(x[1] for x in around)
-            target_ymax = max(x[1] for x in around)
+            # stop each side this far from the target region
+            offset = max_separation
+            target_xmin = min(x[0] for x in around) - offset
+            target_xmax = max(x[0] for x in around) + offset
+            target_ymin = min(x[1] for x in around) - offset
+            target_ymax = max(x[1] for x in around) + offset
             target_check = {
-                "xmin": lambda x: x >= target_xmin - 1,
-                "xmax": lambda x: x <= target_xmax + 1,
-                "ymin": lambda y: y >= target_ymin - 1,
-                "ymax": lambda y: y <= target_ymax + 1,
+                "xmin": lambda x: x >= target_xmin,
+                "xmax": lambda x: x <= target_xmax,
+                "ymin": lambda y: y >= target_ymin,
+                "ymax": lambda y: y <= target_ymax,
             }
+            # but keep at least two rows or columns, merging them into one
+            # would only add a compression before the exact contraction
+            max_separation = max(max_separation, 1)
 
         if sequence is None:
             # contract in both sides along short dimension -> less compression
@@ -2572,8 +2584,9 @@ class TensorNetwork2D(TensorNetworkGen):
             How to perform the compression on the boundary, can also be any of
             the generic 1D or arbgeom methods.
         layer_tags : None or sequence of str, optional
-            If given, perform a multilayer contraction, contracting the inner
-            sites in each layer into the boundary individually.
+            Tags identifying the layers, which are contracted one by one
+            in this order. Use ``None`` to contract all layers together.
+            Booleans and integers are not accepted.
         compress_opts : None or dict, optional
             Other low level options to pass to
             :meth:`~quimb.tensor.tensor_core.TensorNetwork.compress_between`.
@@ -2591,8 +2604,11 @@ class TensorNetwork2D(TensorNetworkGen):
         ymax : int, optional
             The initial right boundary column, defaults to ``Ly - 1``..
         max_separation : int, optional
-            If ``around is None``, when any two sides become this far apart
-            simply contract the remaining tensor network.
+            When any two sides become this far apart simply contract the
+            remaining tensor network. If ``around`` is given, also stop each
+            side this many rows or columns from the target region. With ``0``
+            the boundaries absorb the edge rows or columns of the region, but
+            leave at least two.
         max_unfinished : int, optional
             If ``around is None``, when this many sides are still not within
             ``max_separation`` simply contract the remaining tensor network.
@@ -2623,6 +2639,7 @@ class TensorNetwork2D(TensorNetworkGen):
             Supplied to :meth:`contract_boundary_from`, including compression
             and canonization options.
         """
+        layer_tags = parse_layer_tags(layer_tags)
         method = _parse_boundary_method(method, contract_boundary_opts)
         contract_boundary_opts["max_bond"] = max_bond
         contract_boundary_opts["method"] = method
@@ -2769,18 +2786,21 @@ class TensorNetwork2D(TensorNetworkGen):
             :func:`~quimb.tensor.environments.gen_compressed_environments`.
             By default use '1d' if the other direction is open, and 'ag' if
             it is periodic.
-        schedule : {'auto', 'tree', 'cut'}, optional
+        schedule : {'auto', 'tree', 'cut', 'cutpair'}, optional
             Environment construction schedule, only relevant if ``cyclic``.
             By default use 'tree', which never compresses two environments
-            together. The 'cut' schedule uses fewer compressions but can
-            degrade the approximation by combining two already compressed
-            environments.
+            together. The 'cut' schedule uses fewer compressions but combines
+            two environments as its final step, which can be expensive in an
+            approx contraction setting. The 'cutpair' schedule keeps these two
+            environments separate.
         method : str or callable, optional
             The compression method, supplied to ``compress_fn``. By default
             use its own default method.
-        layer_tags : None or sequence[str], optional
-            Add the tensors at each row or column one layer at a time in this
-            order, compressing after each.
+        layer_tags : None or sequence of str, optional
+            Tags identifying the layers, which are contracted one by one
+            in this order. Use ``None`` to contract all layers together.
+            Booleans and integers are not accepted.
+            Compress after each layer.
         cutoff : float, optional
             Compression cutoff. By default use the default of the compression
             function.
@@ -2803,6 +2823,7 @@ class TensorNetwork2D(TensorNetworkGen):
             The environment of ``block``, which also carries the original
             network's ``.exponent``.
         """
+        layer_tags = parse_layer_tags(layer_tags)
         check_opt("direction", direction, ("x", "y"))
         r2d = Rotator2D(self, None, None, direction + "min")
         if cyclic is None:
@@ -2917,10 +2938,10 @@ class TensorNetwork2D(TensorNetworkGen):
             compressing.
         method : {'mps', 'projector', 'full-bond', ...}, optional
             Which contraction method to use for the environments.
-        layer_tags : str or iterable[str], optional
-            If this 2D TN is multi-layered (e.g. a bra and a ket), and
-            ``method == 'mps'``, contract and compress each specified layer
-            separately, for a cheaper contraction.
+        layer_tags : None or sequence of str, optional
+            Tags identifying the layers, which are contracted one by one
+            in this order. Use ``None`` to contract all layers together.
+            Booleans and integers are not accepted.
         dense : bool, optional
             Whether to use dense tensors for the environments.
         compress_opts : dict, optional
@@ -2946,6 +2967,7 @@ class TensorNetwork2D(TensorNetworkGen):
             A dictionary of the environments, with keys of the form
             ``(from_which, row_or_col_index)``.
         """
+        layer_tags = parse_layer_tags(layer_tags)
         method = _parse_boundary_method(method, contract_boundary_opts)
         tn = self.copy()
 
@@ -3094,12 +3116,10 @@ class TensorNetwork2D(TensorNetworkGen):
             If true, contract the boundary in as a single dense tensor.
         method : {'mps', 'full-bond', ...}, optional
             How to perform the boundary compression.
-        layer_tags : None or sequence[str], optional
-            If ``None``, all tensors at each coordinate pair
-            ``[(i, j), (i + 1, j)]`` will be first contracted. If specified,
-            then the outer tensor at ``(i, j)`` will be contracted with the
-            tensor specified by ``[(i + 1, j), layer_tag]``, for each
-            ``layer_tag`` in ``layer_tags``.
+        layer_tags : None or sequence of str, optional
+            Tags identifying the layers, which are contracted one by one
+            in this order. Use ``None`` to contract all layers together.
+            Booleans and integers are not accepted.
         compress_opts : None or dict, optional
             Supplied to :meth:`compress_between`.
         envs : dict, optional
@@ -3117,6 +3137,7 @@ class TensorNetwork2D(TensorNetworkGen):
             The two environment tensor networks of row ``i`` will be stored in
             ``x_envs['xmin', i]`` and ``x_envs['xmax', i]``.
         """
+        layer_tags = parse_layer_tags(layer_tags)
         method = _parse_boundary_method(method, contract_boundary_opts)
         contract_boundary_opts["max_bond"] = max_bond
         contract_boundary_opts["cutoff"] = cutoff
@@ -3204,12 +3225,10 @@ class TensorNetwork2D(TensorNetworkGen):
             If true, contract the boundary in as a single dense tensor.
         method : {'mps', 'full-bond', ...}, optional
             How to perform the boundary compression.
-        layer_tags : None or sequence[str], optional
-            If ``None``, all tensors at each coordinate pair
-            ``[(i, j), (i + 1, j)]`` will be first contracted. If specified,
-            then the outer tensor at ``(i, j)`` will be contracted with the
-            tensor specified by ``[(i + 1, j), layer_tag]``, for each
-            ``layer_tag`` in ``layer_tags``.
+        layer_tags : None or sequence of str, optional
+            Tags identifying the layers, which are contracted one by one
+            in this order. Use ``None`` to contract all layers together.
+            Booleans and integers are not accepted.
         compress_opts : None or dict, optional
             Supplied to :meth:`compress_between`.
         contract_boundary_opts
@@ -3225,6 +3244,7 @@ class TensorNetwork2D(TensorNetworkGen):
             The two environment tensor networks of column ``j`` will be stored
             in ``y_envs['ymin', j]`` and ``y_envs['ymax', j]``.
         """
+        layer_tags = parse_layer_tags(layer_tags)
         method = _parse_boundary_method(method, contract_boundary_opts)
         contract_boundary_opts["max_bond"] = max_bond
         contract_boundary_opts["cutoff"] = cutoff
@@ -3540,12 +3560,10 @@ class TensorNetwork2D(TensorNetworkGen):
             Whether to sweep one way with canonization before compressing.
         method : {'mps', 'full-bond', ...}, optional
             How to perform the boundary compression.
-        layer_tags : None or sequence[str], optional
-            If ``None``, all tensors at each coordinate pair
-            ``[(i, j), (i + 1, j)]`` will be first contracted. If specified,
-            then the outer tensor at ``(i, j)`` will be contracted with the
-            tensor specified by ``[(i + 1, j), layer_tag]``, for each
-            ``layer_tag`` in ``layer_tags``.
+        layer_tags : None or sequence of str, optional
+            Tags identifying the layers, which are contracted one by one
+            in this order. Use ``None`` to contract all layers together.
+            Booleans and integers are not accepted.
         first_contract : {None, 'x', 'y'}, optional
             The environments can either be generated with initial sweeps in
             the row ('x') or column ('y') direction. Generally it makes sense
@@ -3572,6 +3590,7 @@ class TensorNetwork2D(TensorNetworkGen):
             startings coordinate of the plaquette being the first and the size
             of the plaquette being the second pair.
         """
+        layer_tags = parse_layer_tags(layer_tags)
         method = _parse_boundary_method(method, compute_environment_opts)
         first_contract = _choose_plaquette_first_contract(
             self, x_bsz, y_bsz, first_contract
@@ -3641,10 +3660,10 @@ class TensorNetwork2D(TensorNetworkGen):
             Periodicity in each direction. By default infer it.
         first_contract : {'x', 'y'}, optional
             Direction to contract approximately first.
-        schedule : {'auto', 'tree', 'cut'}, optional
+        schedule : {'auto', 'tree', 'cut', 'cutpair'}, optional
             Construction schedule of the approximate environments in the
             first direction, see :meth:`gen_block_environments`.
-        second_schedule : {'auto', 'tree', 'cut'}, optional
+        second_schedule : {'auto', 'tree', 'cut', 'cutpair'}, optional
             Schedule along each strip. By default use 'cut' for exact
             contraction and 'tree' for compressed contraction.
         second_dense : bool, optional
@@ -3654,9 +3673,11 @@ class TensorNetwork2D(TensorNetworkGen):
             Compression method. By default use the compressor's default for
             each direction. See
             :func:`~quimb.tensor.environments.gen_compressed_environments`.
-        layer_tags : None or sequence[str], optional
-            Contract the tensors of each plane one layer at a time, in this
-            order.
+        layer_tags : None or sequence of str, optional
+            Tags identifying the layers, which are contracted one by one
+            in this order. Use ``None`` to contract all layers together.
+            Booleans and integers are not accepted.
+            Compress after each layer.
         cutoff : float, optional
             Compression cutoff. By default use the default of the compression
             function.
@@ -3680,6 +3701,7 @@ class TensorNetwork2D(TensorNetworkGen):
         dict[((int, int), (int, int)), TensorNetwork]
             Plaquette environments keyed by start and size.
         """
+        layer_tags = parse_layer_tags(layer_tags)
         cyclic_x, cyclic_y = _normalize_2d_cyclic(self, cyclic)
         if not 1 <= x_bsz <= self.Lx:
             raise ValueError("x_bsz must satisfy 1 <= x_bsz <= Lx")
@@ -3714,8 +3736,9 @@ class TensorNetwork2D(TensorNetworkGen):
             compress_opts=compress_opts,
             **compress_method_opts,
         )
-        return dict(
-            _gen_plaquette_environments_via_envs(
+        return {
+            p: environment
+            for p, environment, _ in _gen_plaquette_environments_via_envs(
                 self,
                 tuple((start, (x_bsz, y_bsz)) for start in starts),
                 cyclic_x,
@@ -3726,7 +3749,7 @@ class TensorNetwork2D(TensorNetworkGen):
                 environment_opts,
                 second_dense=second_dense,
             )
-        )
+        }
 
     def coarse_grain_hotrg(
         self,
@@ -4163,8 +4186,11 @@ class TensorNetwork2D(TensorNetworkGen):
         ymax : int, optional
             The initial right boundary column, defaults to ``Ly - 1``..
         max_separation : int, optional
-            If ``around is None``, when any two sides become this far apart
-            simply contract the remaining tensor network.
+            When any two sides become this far apart simply contract the
+            remaining tensor network. If ``around`` is given, also stop each
+            side this many rows or columns from the target region. With ``0``
+            the boundaries absorb the edge rows or columns of the region, but
+            leave at least two.
         around : None or sequence of (int, int), optional
             If given, don't contract the square of sites bounding these
             coordinates.
@@ -4316,6 +4342,34 @@ def _choose_plaquette_first_contract(tn, x_bsz, y_bsz, first_contract):
     return first_contract
 
 
+def _half_absorb_block_layers(
+    tn, envl, envr, block_tags, layer_tags, compress_fn
+):
+    """Absorb the ket layer of the block's first plane into ``envl``, and the
+    bra layer of its last plane into ``envr``. Return the two halves of the
+    strip, ``envl`` with the remaining ket layers, and the remaining bra
+    layers with ``envr``. These keep any exponent the compression gave the
+    environments. An empty environment leaves its layer unabsorbed.
+    """
+    ket_tag, bra_tag = layer_tags
+    # split each plane of the block into its two layers
+    ket_planes = [
+        tn.select((tag, ket_tag), "all", virtual=False) for tag in block_tags
+    ]
+    bra_planes = [
+        tn.select((tag, bra_tag), "all", virtual=False) for tag in block_tags
+    ]
+    # absorb the outermost layer on each side
+    if envl.num_tensors:
+        envl = compress_fn(envl | ket_planes.pop(0))
+    if envr.num_tensors:
+        envr = compress_fn(envr | bra_planes.pop())
+    return (
+        TensorNetwork((envl, *ket_planes)),
+        TensorNetwork((*bra_planes, envr)),
+    )
+
+
 def _gen_plaquette_environments_via_envs(
     tn,
     plaquettes,
@@ -4326,6 +4380,7 @@ def _gen_plaquette_environments_via_envs(
     contract_opts,
     environment_opts,
     second_dense=None,
+    max_separation=1,
 ):
     """Yield environments for plaquettes ``((i, j), (x_bsz, y_bsz))``.
     Plaquettes can differ in size and cross periodic boundaries.
@@ -4337,9 +4392,45 @@ def _gen_plaquette_environments_via_envs(
     Then contract along each strip. By default, contract strips of width one
     exactly and compress wider strips. Set ``second_dense`` to choose
     explicitly.
+
+    With ``max_separation=0.5``, ``envl`` absorbs the first layer of the
+    block's first plane, and ``envr`` the last layer of its last plane,
+    wherever these environments exist. A single periodic environment absorbs
+    only the first layer of the first plane. Contract these strips
+    exactly, and also yield the local sides of each layer at the plaquette.
+    Otherwise yield ``None`` for these.
+
+    Schematically (from the side):
+
+            max_separation=1:      max_separation=0.5:     max_separation=0:
+                      ┊  ┊                  ┊  ┊
+        KET->      ┏━━░──░━━┓          envl┏█──░┓               ┊  ┊
+               envl█        █envr          ┃    ┃           envl█━━█envr
+        BRA->      ┗━━░──░━━┛              ┗░──█┛envr           ┊  ┊
+                      ┊  ┊                  ┊  ┊
+                      ....                  ....                ....
+                   plaquette
+
     """
     # the first direction is 'x' in each rotated frame
     rotators = {d: Rotator2D(tn, None, None, d + "min") for d in "xy"}
+
+    if max_separation == 0.5:
+        if environment_opts["layer_tags"] is None:
+            raise ValueError("`max_separation=0.5` needs `layer_tags`.")
+        from ..tn1d.compress import tensor_network_1d_compress
+        from ..tnag.compress import tensor_network_ag_compress
+
+        # options for compressing a single layer into an environment
+        max_bond = environment_opts["max_bond"]
+        half_absorb_opts = {
+            k: v
+            for k, v in environment_opts.items()
+            if (k not in ("max_bond", "schedule", "layer_tags"))
+            and (v is not None)
+        }
+    elif max_separation != 1:
+        raise ValueError("max_separation must be 1 or 0.5")
 
     # group strip targets by first direction and first block
     blocks_by_direction = {"x": defaultdict(set), "y": defaultdict(set)}
@@ -4364,7 +4455,6 @@ def _gen_plaquette_environments_via_envs(
         r2d = rotators[direction]
         first_tag, second_tag = r2d.x_tag, r2d.y_tag
         first_cyclic, second_cyclic = r2d.rotate(cyclic_x, cyclic_y)
-        first_length = len(r2d.sweep)
 
         first_envs = tn.gen_block_environments(
             direction,
@@ -4374,23 +4464,65 @@ def _gen_plaquette_environments_via_envs(
             **environment_opts,
         )
         second_tags = tuple(map(second_tag, r2d.sweep_other))
+        if max_separation == 0.5:
+            # for compressing environment and one absorbed layer along strip
+            half_compress_fn = functools.partial(
+                tensor_network_ag_compress
+                if second_cyclic
+                else tensor_network_1d_compress,
+                max_bond=max_bond,
+                site_tags=second_tags,
+                **half_absorb_opts,
+            )
 
         # each first environment is used then dropped as soon as it is ready
         for (first, first_bsz), first_env in first_envs:
             first_block_tags = tuple(
                 first_tag(first + d) for d in range(first_bsz)
             )
-            # join the block and its environment for the second sweep
-            strip = tn.select_any(first_block_tags, virtual=False) | first_env
             second_blocks = tuple(second_blocks_by_first[first, first_bsz])
 
-            # by default only contract strips one plane wide exactly
-            if second_dense is None:
-                dense = first_bsz < 2
+            # envl just before the block (can wrap round), envr the rest
+            strip_exponent = first_env.exponent
+            if first_cyclic or first > 0:
+                envl_tids = first_env.tag_map.get(first_tag(first - 1), ())
             else:
-                dense = second_dense
+                envl_tids = ()
+            has_envl = bool(envl_tids)
+            has_envr = len(envl_tids) < first_env.num_tensors
 
-            if dense:
+            half_absorb = (max_separation == 0.5) and (has_envl or has_envr)
+            if half_absorb:
+                if has_envl:
+                    envr, envl = first_env.partition(first_tag(first - 1))
+                else:
+                    envl = TensorNetwork([])
+                    envr = first_env.copy()
+                half_ket_side, half_bra_side = _half_absorb_block_layers(
+                    tn,
+                    envl,
+                    envr,
+                    first_block_tags,
+                    environment_opts["layer_tags"],
+                    half_compress_fn,
+                )
+                strip_exponent += (
+                    half_ket_side.exponent + half_bra_side.exponent
+                )
+                strip = half_ket_side | half_bra_side
+                # remaining strip is thin, so always contract it exactly
+                strip_dense = True
+            else:
+                # just combine block and environment for second sweep
+                strip = tn.select_any(first_block_tags, virtual=False)
+                strip |= first_env
+                # by default only contract strips one plane wide exactly
+                if second_dense is None:
+                    strip_dense = first_bsz < 2
+                else:
+                    strip_dense = second_dense
+
+            if strip_dense:
                 second_envs = gen_exact_environments(
                     strip,
                     second_tags,
@@ -4400,20 +4532,17 @@ def _gen_plaquette_environments_via_envs(
                     contract_opts=contract_opts,
                 )
             else:
-                # compress along the strip
-                if first_cyclic:
-                    # a single piece, connected to both ends of the block
-                    if first_bsz < first_length:
-                        first_block_tags += (first_tag(first + first_bsz),)
-                else:
-                    # a piece either side, unless the block is at an edge
-                    if first > 0:
-                        first_block_tags = (
-                            first_tag(first - 1),
-                            *first_block_tags,
-                        )
-                    if first + first_bsz < first_length:
-                        first_block_tags += (first_tag(first + first_bsz),)
+                # compress along the strip, with envl and envr as extra sites
+                if has_envl:
+                    first_block_tags = (
+                        first_tag(first - 1),
+                        *first_block_tags,
+                    )
+                if has_envr:
+                    first_block_tags = (
+                        *first_block_tags,
+                        first_tag(first + first_bsz),
+                    )
 
                 second_envs = gen_compressed_environments(
                     strip,
@@ -4425,20 +4554,38 @@ def _gen_plaquette_environments_via_envs(
                     **{**environment_opts, "schedule": second_schedule},
                 )
 
+            # now iterate over the second direction
             for (second, second_bsz), second_env in second_envs:
-                # add the first environment's edges alongside the plaquette
-                target_tags = tuple(
+                second_block_tags = tuple(
                     second_tag(second + d) for d in range(second_bsz)
                 )
-                edge_env = first_env.select_any(target_tags, virtual=False)
-                environment = TensorNetwork((second_env, edge_env))
-                environment.exponent += first_env.exponent
+                if half_absorb:
+                    # the absorbed pieces are part of the local sides
+                    environment = second_env
+                    half_local = (
+                        half_ket_side.select_any(
+                            second_block_tags, virtual=False
+                        ),
+                        half_bra_side.select_any(
+                            second_block_tags, virtual=False
+                        ),
+                    )
+                else:
+                    # add the first environment's edges alongside the plaquette
+                    edge_env = (
+                        first_env.select_any(second_block_tags, virtual=False)
+                        if first_env.num_tensors
+                        else TensorNetwork([])
+                    )
+                    environment = TensorNetwork((second_env, edge_env))
+                    half_local = None
+                environment.exponent += strip_exponent
                 # return the plaquette in the original coordinates
-                p = (
+                plaquette = (
                     r2d.rotate(first, second),
                     r2d.rotate(first_bsz, second_bsz),
                 )
-                yield p, environment
+                yield plaquette, environment, half_local
 
 
 def _find_plaquette(where, Lx, Ly, cyclic_x, cyclic_y):
@@ -4447,6 +4594,29 @@ def _find_plaquette(where, Lx, Ly, cyclic_x, cyclic_y):
     i, x_bsz = find_1d_block(xs, Lx, cyclic_x)
     j, y_bsz = find_1d_block(ys, Ly, cyclic_y)
     return (i, j), (x_bsz, y_bsz)
+
+
+def _grow_1d_block(start, size, max_distance, L, cyclic):
+    """Grow the block ``(start, size)`` by ``max_distance`` on each side, and
+    return the new ``(start, size)``. If open, stop at the lattice edges. If
+    periodic, the block can wrap past the boundary. If it would then reach
+    all ``L`` sites, return each site once, splitting the extra sites evenly
+    either side of the original block, with any odd one after it.
+    """
+    if not cyclic:
+        stop = min(start + size + max_distance, L)
+        start = max(start - max_distance, 0)
+        return start, stop - start
+
+    new_size = size + 2 * max_distance
+    if new_size >= L:
+        return (start - (L - size) // 2) % L, L
+    return (start - max_distance) % L, new_size
+
+
+def _tn_partial_trace_cluster_boundary(tn, _, where, **kwargs):
+    """Use a module-level function for executor pickling. Ignore the term."""
+    return tn.partial_trace_cluster_boundary(where, **kwargs)
 
 
 class TensorNetwork2DVector(TensorNetwork2D, TensorNetworkGenVector):
@@ -4651,9 +4821,11 @@ class TensorNetwork2DVector(TensorNetwork2D, TensorNetworkGenVector):
         method : {'mps', 'full-bond', ...}, optional
             How to perform the compression on the boundary, can also be any of
             the generic 1D or arbgeom methods.
-        layer_tags : None or sequence of str, optional
-            If given, perform a multilayer contraction, contracting the inner
-            sites in each layer into the boundary individually.
+        layer_tags : None, bool, int or tuple[str, str], optional
+            Tags for the ket and bra layers, which are then contracted
+            one by one in this order. Use ``True`` or ``1`` for
+            ``("KET", "BRA")``, or ``False``, ``0`` or ``None`` to contract
+            both layers together.
         compress_opts : None or dict, optional
             Other low level options to pass to
             :meth:`~quimb.tensor.tensor_core.TensorNetwork.compress_between`.
@@ -4676,6 +4848,7 @@ class TensorNetwork2DVector(TensorNetwork2D, TensorNetworkGenVector):
         -------
         scalar
         """
+        layer_tags = parse_layer_tags(layer_tags, create=True)
         method = _parse_boundary_method(method, contract_opts)
         norm = self.make_norm(layer_tags=layer_tags)
         return norm.contract_boundary(
@@ -4710,6 +4883,7 @@ class TensorNetwork2DVector(TensorNetwork2D, TensorNetworkGenVector):
         contract_optimize="auto-hq",
         plaquette_envs=None,
         plaquette_map=None,
+        progbar=False,
         **plaquette_env_options,
     ):
         """Compute reduced density matrices using the boundary contraction
@@ -4740,9 +4914,11 @@ class TensorNetwork2DVector(TensorNetwork2D, TensorNetworkGenVector):
             Whether to sweep one way with canonization before compressing.
         method : {'mps', 'full-bond', ...}, optional
             How to perform the compression on the boundary.
-        layer_tags : None or sequence of str, optional
-            If given, perform a multilayer contraction, contracting the inner
-            sites in each layer into the boundary individually.
+        layer_tags : None, bool, int or tuple[str, str], optional
+            Tags for the ket and bra layers, which are then contracted
+            one by one in this order. Use ``True`` or ``1`` for
+            ``("KET", "BRA")``, or ``False``, ``0`` or ``None`` to contract
+            both layers together.
         autogroup : bool, optional
             If ``True`` (the default), group sites into horizontal and
             vertical sets to be computed separately (usually more efficient)
@@ -4756,6 +4932,9 @@ class TensorNetwork2DVector(TensorNetwork2D, TensorNetworkGenVector):
             Supply the mapping of which plaquettes (denoted by
             ``((x0, y0), (dx, dy))``) to use for which coordinates, it will be
             calculated automatically otherwise.
+        progbar : bool, optional
+            Whether to show a progress bar, with one step per reduced density
+            matrix.
         plaquette_env_options
             Supplied to :meth:`compute_plaquette_environments` to generate the
             plaquette environments.
@@ -4766,12 +4945,22 @@ class TensorNetwork2DVector(TensorNetwork2D, TensorNetworkGenVector):
             The reduced density matrix for each ``where``, with sites in the
             order of ``where``.
         """
+        layer_tags = parse_layer_tags(layer_tags, create=True)
         method = _parse_boundary_method(method, plaquette_env_options)
         if cutoff is None:
             cutoff = 1e-10
-        norm, ket, bra = self.make_norm(return_all=True)
+        norm, ket, bra = self.make_norm(layer_tags=layer_tags, return_all=True)
+
+        if progbar:
+            pbar = Progbar(total=len(wheres))
+        else:
+            pbar = None
 
         if plaquette_envs is None:
+            if pbar is not None:
+                # all environments are computed before any rho
+                pbar.set_description("envs")
+
             plaquette_env_options["max_bond"] = max_bond
             plaquette_env_options["cutoff"] = cutoff
             plaquette_env_options["canonize"] = canonize
@@ -4797,6 +4986,9 @@ class TensorNetwork2DVector(TensorNetwork2D, TensorNetworkGenVector):
             key = sites[0] if len(sites) == 1 else sites
             wheres_by_plaquette[plaquette_map[key]].append(where)
 
+        if pbar is not None:
+            pbar.set_description("rdms")
+
         rhos = {}
         for p, p_wheres in wheres_by_plaquette.items():
             tags = tuple(map(ket.site_tag, plaquette_to_sites(p)))
@@ -4814,6 +5006,11 @@ class TensorNetwork2DVector(TensorNetwork2D, TensorNetworkGenVector):
                     optimize=contract_optimize,
                 )
             )
+            if pbar is not None:
+                pbar.update(len(p_wheres))
+
+        if pbar is not None:
+            pbar.close()
 
         return rhos
 
@@ -4825,11 +5022,13 @@ class TensorNetwork2DVector(TensorNetwork2D, TensorNetworkGenVector):
         normalized=True,
         get="matrix",
         autogroup=True,
+        plaquette_sizes=None,
         cyclic=None,
         first_contract=None,
         schedule="auto",
         second_schedule="auto",
         second_dense=None,
+        max_separation=1,
         method=None,
         layer_tags=("KET", "BRA"),
         cutoff=None,
@@ -4838,6 +5037,8 @@ class TensorNetwork2DVector(TensorNetwork2D, TensorNetworkGenVector):
         equalize_norms=False,
         compress_opts=None,
         contract_opts=None,
+        progbar=False,
+        callback_rhos=None,
         **compress_method_opts,
     ):
         """Compute reduced density matrices for open or periodic boundaries.
@@ -4874,28 +5075,53 @@ class TensorNetwork2DVector(TensorNetwork2D, TensorNetworkGenVector):
             that size, keeping its start coordinate. At open boundaries,
             shift it inward if needed to fit the lattice. Reuse an
             environment when both the plaquette size and start match.
+        plaquette_sizes : sequence[tuple[int, int]], optional
+            Plaquette sizes ``(x_bsz, y_bsz)`` to use in place of those
+            chosen by ``autogroup``. Each set of sites must fit in one of
+            them.
         cyclic : bool or tuple[bool, bool], optional
             Periodicity in each direction. By default infer it.
         first_contract : {'x', 'y'}, optional
             Direction to compress first for all plaquettes. By default choose
             it per plaquette to keep the strip narrow, e.g. 'x' for 1x2 and 'y'
             for 2x1. This can require a sweep in each direction.
-        schedule : {'auto', 'tree', 'cut'}, optional
+        schedule : {'auto', 'tree', 'cut', 'cutpair'}, optional
             Construction schedule of the approximate environments in the
             first direction, see :meth:`gen_block_environments`.
-        second_schedule : {'auto', 'tree', 'cut'}, optional
+        second_schedule : {'auto', 'tree', 'cut', 'cutpair'}, optional
             Schedule along each strip. By default use 'cut' for exact
             contraction and 'tree' for compressed contraction.
         second_dense : bool, optional
             Whether to contract along each strip exactly. By default do so only
             for strips of width one. Compress wider strips.
+        max_separation : {1, 0.5}, optional
+            How far to leave between the environments and kept sites. By
+            default (1), they are left adjacent. If 0.5, with two
+            ``layer_tags``, absorb the first layer of adjacent sites into the
+            min-side env and the last layer into the max-side env, wherever
+            these exist. A single periodic env connected to both sides
+            absorbs only the first layer. The remaining strip is then
+            contracted exactly, regardless of ``second_dense``. From the
+            side::
+
+                    max_separation=1:      max_separation=0.5:
+                              ┊  ┊                  ┊  ┊
+                KET->      ┏━━░──░━━┓          envl┏█──░┓
+                       envl█        █envr          ┃    ┃
+                BRA->      ┗━━░──░━━┛              ┗░──█┛envr
+                              ┊  ┊                  ┊  ┊
+                              ....                  ....
+                           plaquette
+
         method : str or callable, optional
             Compression method. By default use the compressor's default for
             each direction. See
             :func:`~quimb.tensor.environments.gen_compressed_environments`.
-        layer_tags : None or sequence[str], optional
-            Contract the tensors of each plane one layer at a time, in this
-            order. By default contract the ket and bra layers separately.
+        layer_tags : None, bool, int or tuple[str, str], optional
+            Tags for the ket and bra layers, which are then contracted
+            one by one in this order. Use ``True`` or ``1`` for
+            ``("KET", "BRA")``, or ``False``, ``0`` or ``None`` to contract
+            both layers together.
         cutoff : float, optional
             Compression cutoff. By default use the default of the compression
             function.
@@ -4912,6 +5138,15 @@ class TensorNetwork2DVector(TensorNetwork2D, TensorNetworkGenVector):
             Options for the exact contractions, of the environments along
             each strip if ``second_dense``, and of each reduced density
             matrix. ``optimize`` is the default path optimizer.
+        progbar : bool, optional
+            Whether to show a progress bar, with one step per reduced density
+            matrix.
+        callback_rhos : callable, optional
+            If given, call ``callback_rhos(rhos)`` with the new reduced density
+            matrices of each plaquette as soon as they are ready, in the same
+            form as the return value. Plaquettes finish in sweep order, not
+            the order of ``wheres``. This can be used to save results during
+            a long run.
         compress_method_opts
             Additional options supplied to the compression method.
 
@@ -4921,32 +5156,44 @@ class TensorNetwork2DVector(TensorNetwork2D, TensorNetworkGenVector):
             The reduced density matrix for each ``where``, with sites in the
             order of ``where``.
         """
+        layer_tags = parse_layer_tags(layer_tags, create=True)
         cyclic_x, cyclic_y = _normalize_2d_cyclic(self, cyclic)
-        norm, ket, bra = self.make_norm(return_all=True)
+        norm, ket, bra = self.make_norm(layer_tags=layer_tags, return_all=True)
         plaquettes = {
             where: _find_plaquette(where, self.Lx, self.Ly, cyclic_x, cyclic_y)
             for where in wheres
         }
-        sizes = {size for _, size in plaquettes.values()}
-        if autogroup:
-            # drop sizes contained in another, e.g. 1x2 and 2x1 in 2x2
-            sizes = {
-                a
-                for a in sizes
-                if not any(
-                    a != b and a[0] <= b[0] and a[1] <= b[1] for b in sizes
+        if plaquette_sizes is not None:
+            sizes = set(map(tuple, plaquette_sizes))
+            if any(x > self.Lx or y > self.Ly for x, y in sizes):
+                raise ValueError(
+                    f"Plaquette sizes {plaquette_sizes} must fit in the "
+                    f"{self.Lx}x{self.Ly} lattice."
                 )
-            }
         else:
-            # a single plaquette size that covers every set of sites
-            sizes = {tuple(map(max, zip(*sizes)))}
+            sizes = {size for _, size in plaquettes.values()}
+            if autogroup:
+                # drop sizes contained in another, e.g. 1x2 and 2x1 in 2x2
+                sizes = {
+                    a
+                    for a in sizes
+                    if not any(
+                        a != b and a[0] <= b[0] and a[1] <= b[1] for b in sizes
+                    )
+                }
+            else:
+                # a single plaquette size that covers every set of sites
+                sizes = {tuple(map(max, zip(*sizes)))}
 
         for where, ((i, j), (x_bsz, y_bsz)) in plaquettes.items():
             # use the smallest remaining size that contains these sites
-            x_bsz, y_bsz = min(
-                (b for b in sizes if x_bsz <= b[0] and y_bsz <= b[1]),
-                key=lambda b: (b[0] * b[1], b),
-            )
+            possible = [b for b in sizes if x_bsz <= b[0] and y_bsz <= b[1]]
+            if not possible:
+                raise ValueError(
+                    f"None of the plaquette sizes {plaquette_sizes} fit the "
+                    f"sites {where}, which need at least {x_bsz}x{y_bsz}."
+                )
+            x_bsz, y_bsz = min(possible, key=lambda b: (b[0] * b[1], b))
             if not cyclic_x:
                 i = min(i, self.Lx - x_bsz)
             if not cyclic_y:
@@ -4981,32 +5228,381 @@ class TensorNetwork2DVector(TensorNetwork2D, TensorNetworkGenVector):
             contract_opts,
             environment_opts,
             second_dense=second_dense,
+            max_separation=max_separation,
         )
 
+        if progbar:
+            # environments are generated lazily, so this follows full cost
+            pbar = Progbar(total=len(wheres), desc="rdms")
+        else:
+            pbar = None
+
         rhos = {}
-        for p, environment in plaquette_envs:
-            (i, j), (x_bsz, y_bsz) = p
-            tags = tuple(
-                ket.site_tag((i + di) % self.Lx, (j + dj) % self.Ly)
-                for di in range(x_bsz)
-                for dj in range(y_bsz)
-            )
-            ket_local = ket.select_any(tags, virtual=False)
-            bra_local = bra.select_any(tags, virtual=False)
-            rhos.update(
-                partial_traces_from_environment(
-                    self,
-                    wheres_by_plaquette[p],
-                    ket_local,
-                    bra_local,
-                    environment,
-                    normalized=normalized,
-                    get=get,
-                    **contract_opts,
+        for plaquette, environment, half_local in plaquette_envs:
+            if half_local is not None:
+                # envs already absorbed into a local plaquette
+                ket_local, bra_local = half_local
+            else:
+                # select the plaquette from each layer
+                (i, j), (x_bsz, y_bsz) = plaquette
+                tags = tuple(
+                    ket.site_tag((i + di) % self.Lx, (j + dj) % self.Ly)
+                    for di in range(x_bsz)
+                    for dj in range(y_bsz)
                 )
+                ket_local = ket.select_any(tags, virtual=False)
+                bra_local = bra.select_any(tags, virtual=False)
+
+            # contract plaquette with env to all local rdms!
+            new_rhos = partial_traces_from_environment(
+                self,
+                wheres_by_plaquette[plaquette],
+                ket_local,
+                bra_local,
+                environment,
+                normalized=normalized,
+                get=get,
+                **contract_opts,
             )
+            rhos.update(new_rhos)
+            if callback_rhos is not None:
+                callback_rhos(new_rhos)
+            if pbar is not None:
+                pbar.update(len(wheres_by_plaquette[plaquette]))
+
+        if pbar is not None:
+            pbar.close()
 
         return rhos
+
+    def partial_trace_cluster_boundary(
+        self,
+        keep,
+        max_bond,
+        *,
+        max_distance=1,
+        max_separation=1,
+        gauges=None,
+        cutoff=None,
+        method=None,
+        canonize=True,
+        layer_tags=("KET", "BRA"),
+        first_contract=None,
+        cyclic=None,
+        normalized=True,
+        get="matrix",
+        smudge=1e-12,
+        power=1.0,
+        optimize="auto-hq",
+        compress_opts=None,
+        **contract_boundary_opts,
+    ):
+        """Compute an approximate reduced density matrix from a local
+        rectangular cluster. Grow the smallest rectangle containing ``keep``
+        by ``max_distance`` sites on each side. Insert simple update bond
+        ``gauges`` if supplied. Sweep one axis inward until at most
+        ``max_separation`` rows or columns remain on each side of the kept
+        sites. Contract the remaining network exactly. From the side::
+
+                max_separation=1:     max_separation=0.5:     max_separation=0:
+                          ┊  ┊                 ┊  ┊
+            KET->      ┏━━░──░━━┓         envl┏█──░┓               ┊  ┊
+                   envl█        █envr         ┃    ┃           envl█━━█envr
+            BRA->      ┗━━░──░━━┛             ┗░──█┛envr           ┊  ┊
+                          ┊  ┊                 ┊  ┊
+                          ....                 ....                ....
+                       plaquette
+
+        The cluster can cross a periodic boundary. It is treated as an open
+        network, so it supports the usual boundary compression methods,
+        including 1D methods.
+
+        Parameters
+        ----------
+        keep : coordinate or sequence of coordinates
+            Sites to keep. They can cross either periodic boundary.
+        max_bond : int or None
+            Maximum boundary bond dimension, often called 'chi'. Use ``None``
+            to truncate using only ``cutoff``.
+        max_distance : int, optional
+            Number of sites to add on each side. Must be non-negative. Open
+            boundaries clip the cluster to the lattice. If the cluster would
+            cover a whole periodic direction, the two sides are cut.
+        max_separation : int or 0.5, optional
+            How far to leave between the boundary and kept sites. By default
+            (1), they are left adjacent. If 0, the boundaries also absorb the
+            adjacent row (but not if this means joining envs). If 0.5, with
+            two ``layer_tags``, absorb the first layer of adjacent sites into
+            the min-side env and the last layer into the max-side env,
+            wherever these exist.
+        gauges : dict[str, array_like], optional
+            Simple update bond gauges keyed by index. Only matching bonds
+            receive a gauge.
+        cutoff : float, optional
+            Singular value cutoff for boundary compression. Defaults to
+            ``1e-10``.
+        method : {'mps', 'full-bond', 'projector2d', ...}, optional
+            Boundary compression method. Any 1D compression method is also
+            accepted. Defaults to ``'mps'``.
+        canonize : bool, optional
+            Whether to canonize before compressing.
+        layer_tags : None, bool, int or tuple[str, str], optional
+            Tags for the ket and bra layers, which are then contracted
+            one by one in this order. Use ``True`` or ``1`` for
+            ``("KET", "BRA")``, or ``False``, ``0`` or ``None`` to contract
+            both layers together.
+        first_contract : {'x', 'y'}, optional
+            Axis to sweep. By default, choose the one that leaves the
+            narrowest strip.
+        cyclic : bool or tuple[bool, bool], optional
+            Periodicity in each direction. By default, infer it.
+        normalized : bool or "return", optional
+            Normalize to unit trace. If ``"return"``, return ``(rho, trace)``
+            without dividing by the trace. Ignored for ``get="tn"``.
+        get : {'matrix', 'array', 'tensor', 'tn'}, optional
+            Return a matrix, array, tensor, or the uncontracted network.
+            ``'tn'`` returns the remaining strip without a separate trace.
+        smudge : float, optional
+            Value added to gauges before insertion, relative to the largest
+            gauge value.
+        power : float, optional
+            Power applied to gauges before insertion.
+        optimize : str or PathOptimizer, optional
+            Path optimizer for the final contraction.
+        compress_opts : None or dict, optional
+            Additional boundary compression options.
+        contract_boundary_opts
+            Additional options passed to :meth:`contract_boundary`.
+
+        Returns
+        -------
+        array or Tensor or TensorNetwork or (array, float) or (Tensor, float)
+        """
+        layer_tags = parse_layer_tags(layer_tags, create=True)
+        if max_distance < 0:
+            raise ValueError(
+                f"`max_distance` must be non-negative, got {max_distance}."
+            )
+        keep = (tuple(keep),) if is_lone_coo(keep) else tuple(map(tuple, keep))
+        method = _parse_boundary_method(method, contract_boundary_opts)
+        if cutoff is None:
+            cutoff = 1e-10
+
+        cyclic_x, cyclic_y = _normalize_2d_cyclic(self, cyclic)
+        (i, j), (x_bsz, y_bsz) = _find_plaquette(
+            keep, self.Lx, self.Ly, cyclic_x, cyclic_y
+        )
+        x0, nx = _grow_1d_block(i, x_bsz, max_distance, self.Lx, cyclic_x)
+        y0, ny = _grow_1d_block(j, y_bsz, max_distance, self.Ly, cyclic_y)
+
+        # map global coordinates to the open cluster
+        x_to_local = {(x0 + dx) % self.Lx: dx for dx in range(nx)}
+        y_to_local = {(y0 + dy) % self.Ly: dy for dy in range(ny)}
+        site_map = {
+            self.site_tag(x, y): self.site_tag(dx, dy)
+            for x, dx in x_to_local.items()
+            for y, dy in y_to_local.items()
+        }
+
+        cluster = self.select_any(tuple(site_map), virtual=False)
+
+        # if cluster extents all the way round, need to cut the bonds
+        full_x = cyclic_x and (nx == self.Lx)
+        full_y = cyclic_y and (ny == self.Ly)
+        if (full_x and self.Lx < 3) or (full_y and self.Ly < 3):
+            raise ValueError(
+                "A cluster can only cover a periodic direction with at least "
+                "3 sites."
+            )
+        cuts = []
+        if full_x:
+            cuts.extend((((x0 - 1) % self.Lx, y), (x0, y)) for y in y_to_local)
+        if full_y:
+            cuts.extend(((x, (y0 - 1) % self.Ly), (x, y0)) for x in x_to_local)
+        if cuts and gauges is not None:
+            # we need to copy gauges on either side
+            gauges = dict(gauges)
+
+        for coo_a, coo_b in cuts:
+            tn_b = cluster.select(self.site_tag(*coo_b))
+            for ix in bonds(cluster.select(self.site_tag(*coo_a)), tn_b):
+                new_ix = rand_uuid()
+                tn_b.reindex_({ix: new_ix})
+                if gauges is not None and ix in gauges:
+                    # both sides keep the full gauge
+                    gauges[new_ix] = gauges[ix]
+
+        if gauges is not None:
+            cluster.gauge_simple_insert(gauges, smudge=smudge, power=power)
+        cluster.retag_(
+            {
+                **site_map,
+                **{
+                    self.x_tag(x): self.x_tag(dx)
+                    for x, dx in x_to_local.items()
+                },
+                **{
+                    self.y_tag(y): self.y_tag(dy)
+                    for y, dy in y_to_local.items()
+                },
+            }
+        )
+        cluster.view_as_(TensorNetwork2D, like=self, Lx=nx, Ly=ny)
+        first_contract = _choose_plaquette_first_contract(
+            cluster, x_bsz, y_bsz, first_contract
+        )
+        keep_local = tuple(
+            (x_to_local[x % self.Lx], y_to_local[y % self.Ly]) for x, y in keep
+        )
+
+        # keep the physical ket and bra indices separate at these sites
+        _, ket, bra = cluster.make_norm(layer_tags=layer_tags, return_all=True)
+        k_inds = tuple(map(self.site_ind, keep))
+        b_inds = get_bra_inds(self, keep, warn=get in ("tensor", "tn"))
+        bra.reindex_(dict(zip(k_inds, b_inds)))
+
+        if max_separation == 0.5:
+            if layer_tags is None:
+                raise ValueError("`max_separation=0.5` needs `layer_tags`.")
+            from ..tn1d.compress import tensor_network_1d_compress
+
+        rho_tn = ket.combine(bra, virtual=True, check_collisions=False)
+        rho_tn.view_as_(TensorNetwork2D, like=cluster, Lx=nx, Ly=ny)
+        rho_tn.contract_boundary_(
+            max_bond,
+            cutoff=cutoff,
+            canonize=canonize,
+            method=method,
+            layer_tags=layer_tags,
+            compress_opts=compress_opts,
+            sequence=(f"{first_contract}min", f"{first_contract}max"),
+            around=keep_local,
+            # with 0.5 the boundaries absorb one layer each afterwards
+            max_separation=1 if max_separation == 0.5 else max_separation,
+            **contract_boundary_opts,
+        )
+
+        if max_separation == 0.5:
+            # the lines holding the kept sites, and any boundary on each side
+            first_axis = "xy".index(first_contract)
+            first_tag, second_tag = (
+                (rho_tn.x_tag, rho_tn.y_tag)
+                if first_axis == 0
+                else (rho_tn.y_tag, rho_tn.x_tag)
+            )
+            kept_lines = [coo[first_axis] for coo in keep_local]
+            kept_start, kept_stop = min(kept_lines), max(kept_lines) + 1
+            n_first, n_second = (nx, ny) if first_axis == 0 else (ny, nx)
+            if kept_start > 0:
+                envl = rho_tn.select(first_tag(kept_start - 1))
+            else:
+                envl = TensorNetwork([])
+            if kept_stop < n_first:
+                envr = rho_tn.select(first_tag(kept_stop))
+            else:
+                envr = TensorNetwork([])
+
+            if envl.num_tensors or envr.num_tensors:
+                # compress a boundary and one absorbed layer along the lines
+                half_compress_fn = functools.partial(
+                    tensor_network_1d_compress,
+                    max_bond=max_bond,
+                    cutoff=cutoff,
+                    # 2d only boundary methods use 'direct' for a single layer
+                    method=(
+                        "direct"
+                        if method in ("mps", "full-bond", "projector2d")
+                        else method
+                    ),
+                    site_tags=tuple(map(second_tag, range(n_second))),
+                    canonize=canonize,
+                    compress_opts=compress_opts,
+                )
+                half_ket_side, half_bra_side = _half_absorb_block_layers(
+                    rho_tn,
+                    envl,
+                    envr,
+                    tuple(map(first_tag, range(kept_start, kept_stop))),
+                    layer_tags,
+                    half_compress_fn,
+                )
+                # the strip is now the two halves, keep the sweep's exponent
+                rho_exponent = rho_tn.exponent
+                rho_tn = TensorNetwork((half_ket_side, half_bra_side))
+                rho_tn.exponent += rho_exponent
+
+        return contract_reduced_density_matrix(
+            rho_tn,
+            k_inds,
+            b_inds,
+            normalized=normalized,
+            get=get,
+            optimize=optimize,
+        )
+
+    def compute_partial_traces_cluster_boundary(
+        self,
+        wheres,
+        max_bond,
+        *,
+        max_distance=1,
+        gauges=None,
+        normalized=True,
+        get="matrix",
+        executor=None,
+        progbar=False,
+        **kwargs,
+    ):
+        """Compute reduced density matrices for many sets of sites. Use a
+        separate rectangular cluster for each set. See
+        :meth:`partial_trace_cluster_boundary`.
+
+        Parameters
+        ----------
+        wheres : sequence of coordinate or sequence of coordinates
+            Sites to keep for each reduced density matrix. Each set can cross
+            either periodic boundary.
+        max_bond : int or None
+            Maximum boundary bond dimension, often called 'chi'. Use ``None``
+            to truncate using only ``cutoff``.
+        max_distance : int, optional
+            Number of sites to add on each side. Must be non-negative.
+        gauges : dict[str, array_like], optional
+            Simple update bond gauges keyed by index.
+        normalized : bool or "return", optional
+            Normalize each reduced density matrix to unit trace. If
+            ``"return"``, return each as ``(rho, trace)`` without dividing by
+            the trace. Ignored for ``get="tn"``.
+        get : {'matrix', 'array', 'tensor', 'tn'}, optional
+            Return each result as a matrix, array, tensor, or uncontracted
+            network.
+        executor : Executor, optional
+            Run the computations in parallel with this executor.
+        progbar : bool, optional
+            Whether to show one progress step per reduced density matrix.
+        kwargs
+            Additional options for :meth:`partial_trace_cluster_boundary`.
+
+        Returns
+        -------
+        dict[coordinate or tuple[coordinate], array or Tensor or TensorNetwork]
+            The reduced density matrix for each ``where``, with sites in the
+            order of ``where``.
+        """
+        return _compute_expecs_maybe_in_parallel(
+            fn=_tn_partial_trace_cluster_boundary,
+            tn=self,
+            terms=dict.fromkeys(wheres),
+            return_all=True,
+            executor=executor,
+            progbar=progbar,
+            max_bond=max_bond,
+            max_distance=max_distance,
+            gauges=gauges,
+            normalized=normalized,
+            get=get,
+            **kwargs,
+        )
 
     def compute_partial_traces(
         self,
@@ -5018,6 +5614,7 @@ class TensorNetwork2DVector(TensorNetwork2D, TensorNetworkGenVector):
         normalized=True,
         get="matrix",
         route=None,
+        progbar=False,
         **kwargs,
     ):
         """Compute many local reduced density matrices at once, each from the
@@ -5034,12 +5631,10 @@ class TensorNetwork2DVector(TensorNetwork2D, TensorNetworkGenVector):
         cutoff : float, optional
             The cutoff used when compressing the environments. By default use
             the default of the compression function, or ``1e-10`` for
-            ``route='boundary'``.
+            ``route='boundary'`` and ``route='cluster_boundary'``.
         method : str or callable, optional
-            The compression method, see
-            :meth:`compute_partial_traces_boundary` for ``route='boundary'``
-            and :meth:`compute_partial_traces_via_envs` for ``route='envs'``.
-            By default use the default of each.
+            Compression method for the selected route. By default, use that
+            route's default.
         normalized : bool or "return", optional
             Normalize each reduced density matrix to unit trace. If "return",
             give each as ``(rho, trace)`` without dividing by the trace.
@@ -5055,8 +5650,8 @@ class TensorNetwork2DVector(TensorNetwork2D, TensorNetworkGenVector):
             - 'tensor': a :class:`~quimb.tensor.tensor_core.Tensor` with the
               ket and bra indices.
             - 'tn': the uncontracted tensor network.
-        route : {None, 'boundary', 'envs'}, optional
-            How to compute the plaquette environments. By default use
+        route : {None, 'boundary', 'envs', 'cluster_boundary'}, optional
+            How to compute each reduced density matrix. By default, use
             ``'envs'`` if either direction is periodic and ``'boundary'``
             otherwise.
 
@@ -5066,7 +5661,13 @@ class TensorNetwork2DVector(TensorNetwork2D, TensorNetworkGenVector):
             - 'envs': an approximate sweep in one direction, then sweeps
               along each strip in the other direction, see
               :meth:`compute_partial_traces_via_envs`.
+            - 'cluster_boundary': contract a separate cluster around each set
+              of sites, with optional simple update gauges, see
+              :meth:`partial_trace_cluster_boundary`.
 
+        progbar : bool, optional
+            Whether to show a progress bar, with one step per reduced density
+            matrix.
         kwargs
             Supplied to the method chosen by ``route``.
 
@@ -5079,10 +5680,12 @@ class TensorNetwork2DVector(TensorNetwork2D, TensorNetworkGenVector):
         if route is None:
             cyclic = self.is_cyclic_x() or self.is_cyclic_y()
             route = "envs" if cyclic else "boundary"
-        check_opt("route", route, ("boundary", "envs"))
+        check_opt("route", route, ("boundary", "envs", "cluster_boundary"))
 
         if route == "envs":
             fn = self.compute_partial_traces_via_envs
+        elif route == "cluster_boundary":
+            fn = self.compute_partial_traces_cluster_boundary
         else:
             fn = self.compute_partial_traces_boundary
         return fn(
@@ -5092,6 +5695,7 @@ class TensorNetwork2DVector(TensorNetwork2D, TensorNetworkGenVector):
             method=method,
             normalized=normalized,
             get=get,
+            progbar=progbar,
             **kwargs,
         )
 
@@ -5122,12 +5726,10 @@ class TensorNetwork2DVector(TensorNetwork2D, TensorNetworkGenVector):
         cutoff : float, optional
             The cutoff used when compressing the environments. By default use
             the default of the compression function, or ``1e-10`` for
-            ``route='boundary'``.
+            ``route='boundary'`` and ``route='cluster_boundary'``.
         method : str or callable, optional
-            The compression method, see
-            :meth:`compute_partial_traces_boundary` for ``route='boundary'``
-            and :meth:`compute_partial_traces_via_envs` for ``route='envs'``.
-            By default use the default of each.
+            Compression method for the selected route. By default, use that
+            route's default.
         normalized : bool or "return", optional
             Normalize the reduced density matrix to unit trace. If "return",
             give ``(rho, trace)`` without dividing by the trace. Ignored if
@@ -5136,7 +5738,7 @@ class TensorNetwork2DVector(TensorNetwork2D, TensorNetworkGenVector):
         get : {'matrix', 'array', 'tensor', 'tn'}, optional
             How to return the reduced density matrix, see
             :meth:`compute_partial_traces`.
-        route : {None, 'boundary', 'envs'}, optional
+        route : {None, 'boundary', 'envs', 'cluster_boundary'}, optional
             How to compute the plaquette environment, see
             :meth:`compute_partial_traces`.
         kwargs
@@ -5167,6 +5769,7 @@ class TensorNetwork2DVector(TensorNetwork2D, TensorNetworkGenVector):
         method=None,
         normalized=True,
         return_all=False,
+        progbar=False,
         **kwargs,
     ):
         """Compute many local expectations at once, as ``tr(rho G)`` with each
@@ -5196,6 +5799,9 @@ class TensorNetwork2DVector(TensorNetwork2D, TensorNetworkGenVector):
         return_all : bool, optional
             Whether to return each expectation in ``terms`` separately or sum
             them all together (the default).
+        progbar : bool, optional
+            Whether to show a progress bar, with one step per reduced density
+            matrix.
         kwargs
             Supplied to :meth:`compute_partial_traces_via_envs`.
 
@@ -5211,6 +5817,74 @@ class TensorNetwork2DVector(TensorNetwork2D, TensorNetworkGenVector):
             normalized=normalized,
             return_all=return_all,
             route="envs",
+            progbar=progbar,
+            **kwargs,
+        )
+
+    def compute_local_expectation_cluster_boundary(
+        self,
+        terms,
+        max_bond,
+        *,
+        max_distance=1,
+        gauges=None,
+        cutoff=None,
+        method=None,
+        normalized=True,
+        return_all=False,
+        progbar=False,
+        **kwargs,
+    ):
+        """Compute local expectations as ``tr(rho G)``. Form each reduced
+        density matrix ``rho`` from a separate rectangular cluster. See
+        :meth:`partial_trace_cluster_boundary`.
+
+        Parameters
+        ----------
+        terms : dict[coordinate or tuple[coordinate], array_like]
+            Local terms keyed by site or sites. Sites can cross either
+            periodic boundary. Each term should be a matrix or an array with
+            one axis per ket site, then one axis per bra site.
+        max_bond : int or None
+            Maximum boundary bond dimension, often called 'chi'. Use ``None``
+            to truncate using only ``cutoff``.
+        max_distance : int, optional
+            Number of sites to add on each side. Must be non-negative.
+        gauges : dict[str, array_like], optional
+            Simple update bond gauges keyed by index.
+        cutoff : float, optional
+            Singular value cutoff for boundary compression. Defaults to
+            ``1e-10``.
+        method : str or callable, optional
+            Boundary compression method. Defaults to ``'mps'``.
+        normalized : bool or "return", optional
+            Normalize each reduced density matrix to unit trace. If
+            ``"return"`` and ``return_all=True``, return ``(expec, trace)``
+            for each term without dividing by the trace. If ``"return"`` and
+            ``return_all=False``, divide each value by its trace before summing.
+        return_all : bool, optional
+            Whether to return each expectation. By default, return their sum.
+        progbar : bool, optional
+            Whether to show one progress step per reduced density matrix.
+        kwargs
+            Additional options for
+            :meth:`compute_partial_traces_cluster_boundary`.
+
+        Returns
+        -------
+        scalar or dict
+        """
+        return self.compute_local_expectation(
+            terms,
+            max_bond,
+            max_distance=max_distance,
+            gauges=gauges,
+            cutoff=cutoff,
+            method=method,
+            normalized=normalized,
+            return_all=return_all,
+            route="cluster_boundary",
+            progbar=progbar,
             **kwargs,
         )
 
@@ -5224,6 +5898,7 @@ class TensorNetwork2DVector(TensorNetwork2D, TensorNetworkGenVector):
         normalized=True,
         return_all=False,
         route=None,
+        progbar=False,
         **kwargs,
     ):
         r"""Compute local expectations as ``tr(rho G)``, using reduced density
@@ -5248,12 +5923,10 @@ class TensorNetwork2DVector(TensorNetwork2D, TensorNetworkGenVector):
         cutoff : float, optional
             The cutoff used when compressing the environments. By default use
             the default of the compression function, or ``1e-10`` for
-            ``route='boundary'``.
+            ``route='boundary'`` and ``route='cluster_boundary'``.
         method : str or callable, optional
-            The compression method, see
-            :meth:`compute_partial_traces_boundary` for ``route='boundary'``
-            and :meth:`compute_partial_traces_via_envs` for ``route='envs'``.
-            By default use the default of each.
+            Compression method for the selected route. By default, use that
+            route's default.
         normalized : bool or "return", optional
             Normalize each local reduced density matrix to unit trace. If
             "return" and ``return_all=True``, give each term as
@@ -5261,13 +5934,15 @@ class TensorNetwork2DVector(TensorNetwork2D, TensorNetworkGenVector):
         return_all : bool, optional
             Whether to return each expectation in ``terms`` separately or sum
             them all together (the default).
-        route : {None, 'boundary', 'envs'}, optional
-            How to compute the plaquette environments, see
+        route : {None, 'boundary', 'envs', 'cluster_boundary'}, optional
+            How to compute each reduced density matrix, see
             :meth:`compute_partial_traces`. By default use ``'envs'`` if
             either direction is periodic and ``'boundary'`` otherwise.
+        progbar : bool, optional
+            Whether to show a progress bar, with one step per reduced density
+            matrix.
         kwargs
-            Supplied to :meth:`compute_partial_traces_boundary` or
-            :meth:`compute_partial_traces_via_envs`, depending on ``route``.
+            Additional options for the selected route.
 
         Returns
         -------
@@ -5281,6 +5956,7 @@ class TensorNetwork2DVector(TensorNetwork2D, TensorNetworkGenVector):
             normalized=normalized,
             get="array",
             route=route,
+            progbar=progbar,
             **kwargs,
         )
         return expectations_from_rhos(
@@ -5317,17 +5993,15 @@ class TensorNetwork2DVector(TensorNetwork2D, TensorNetworkGenVector):
         cutoff : float, optional
             The cutoff used when compressing the environments. By default use
             the default of the compression function, or ``1e-10`` for
-            ``route='boundary'``.
+            ``route='boundary'`` and ``route='cluster_boundary'``.
         method : str or callable, optional
-            The compression method, see
-            :meth:`compute_partial_traces_boundary` for ``route='boundary'``
-            and :meth:`compute_partial_traces_via_envs` for ``route='envs'``.
-            By default use the default of each.
+            Compression method for the selected route. By default, use that
+            route's default.
         normalized : bool or "return", optional
             Normalize the reduced density matrix to unit trace. If "return",
             give ``(expec, trace)`` without dividing by the trace.
-        route : {None, 'boundary', 'envs'}, optional
-            How to compute the plaquette environment, see
+        route : {None, 'boundary', 'envs', 'cluster_boundary'}, optional
+            How to compute the reduced density matrix, see
             :meth:`compute_partial_traces`.
         kwargs
             Supplied to :meth:`compute_partial_traces`.
@@ -5378,9 +6052,11 @@ class TensorNetwork2DVector(TensorNetwork2D, TensorNetworkGenVector):
             Whether to sweep one way with canonization before compressing.
         method : {'mps', 'full-bond', ...}, optional
             How to perform the compression on the boundary.
-        layer_tags : None or sequence of str, optional
-            If given, perform a multilayer contraction, contracting the inner
-            sites in each layer into the boundary individually.
+        layer_tags : None, bool, int or tuple[str, str], optional
+            Tags for the ket and bra layers, which are then contracted
+            one by one in this order. Use ``True`` or ``1`` for
+            ``("KET", "BRA")``, or ``False``, ``0`` or ``None`` to contract
+            both layers together.
         balance_bonds : bool, optional
             Whether to balance the bonds after normalization, a form of
             conditioning.
@@ -5394,6 +6070,7 @@ class TensorNetwork2DVector(TensorNetwork2D, TensorNetworkGenVector):
             :meth:`~quimb.tensor.tn2d.core.TensorNetwork2D.contract_boundary`,
             by default, two layer contraction will be used.
         """
+        layer_tags = parse_layer_tags(layer_tags, create=True)
         method = _parse_boundary_method(method, contract_boundary_opts)
         contract_boundary_opts["max_bond"] = max_bond
         contract_boundary_opts["cutoff"] = cutoff
@@ -5401,7 +6078,7 @@ class TensorNetwork2DVector(TensorNetwork2D, TensorNetworkGenVector):
         contract_boundary_opts["method"] = method
         contract_boundary_opts["layer_tags"] = layer_tags
 
-        norm = self.make_norm()
+        norm = self.make_norm(layer_tags=layer_tags)
         nfact = norm.contract_boundary(**contract_boundary_opts)
 
         n_ket = self.multiply_each(

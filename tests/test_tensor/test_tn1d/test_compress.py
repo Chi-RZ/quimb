@@ -405,6 +405,322 @@ def test_dm_truncating_matches_direct(symmetry, bond_orientation, direction):
     assert value_dm == pytest.approx(value_direct, rel=1e-8)
 
 
+@requires_symmray
+@pytest.mark.parametrize("layer_tags", [None, ("KET", "BRA")])
+@pytest.mark.parametrize("direction", ["xmin", "xmax", "ymin", "ymax"])
+def test_dm_truncating_matches_direct_fermionic_norm(layer_tags, direction):
+    """Check truncated DM compression of the norm of an odd parity fermionic
+    PEPS, whose bra tensors carry dual dummy modes.
+    """
+    import symmray as sr
+
+    psi = sr.PEPS_fermionic_rand(
+        "Z2",
+        4,
+        4,
+        bond_dim=2,
+        phys_dim=2,
+        site_charge=lambda site: 1,
+        seed=7,
+        dist="uniform",
+        loc=-0.5,
+    )
+    norm = psi.make_norm()
+    contraction_options = {
+        "max_bond": 4,
+        "cutoff": 0.0,
+        "sequence": (direction,),
+        "layer_tags": layer_tags,
+    }
+    value_dm = norm.contract_boundary(method="dm", **contraction_options)
+    value_direct = norm.contract_boundary(
+        method="direct", **contraction_options
+    )
+    assert value_dm == pytest.approx(value_direct, rel=1e-8)
+
+
+@pytest.mark.parametrize("dtype", ["float64", "complex128"])
+@pytest.mark.parametrize(
+    "dm_opts,direct_opts",
+    [
+        pytest.param(
+            {"max_bond": 3, "cutoff": 0.0},
+            {"max_bond": 3, "cutoff": 0.0},
+            id="max_bond",
+        ),
+        # dm truncates the squares of the singular values that direct sees
+        pytest.param(
+            {"max_bond": 16, "cutoff": 1e-4, "cutoff_mode": "rel"},
+            {"max_bond": 16, "cutoff": 1e-2, "cutoff_mode": "rel"},
+            id="rel",
+        ),
+        pytest.param(
+            {"max_bond": 16, "cutoff": 1e-3, "cutoff_mode": "rsum1"},
+            {"max_bond": 16, "cutoff": 1e-3, "cutoff_mode": "rsum2"},
+            id="rsum1",
+        ),
+    ],
+)
+def test_dm_layered_norm_matches_direct(dtype, dm_opts, direct_opts):
+    """Check truncated DM compression of a layered norm, where each site's
+    density matrix is larger than its rank, so is not formed explicitly.
+    """
+    peps = qtn.PEPS.rand(4, 4, bond_dim=2, phys_dim=2, seed=7, dtype=dtype)
+    norm = peps.make_norm()
+    # make the absolute scale of the eigenvalues meaningful
+    norm.multiply_(1 / norm.contract(), spread_over="all")
+    contraction_options = {
+        "layer_tags": ("KET", "BRA"),
+        "sequence": ("ymin",),
+    }
+    value_dm = norm.contract_boundary(
+        method="dm", **dm_opts, **contraction_options
+    )
+    value_direct = norm.contract_boundary(
+        method="direct", **direct_opts, **contraction_options
+    )
+    # check that truncation happened
+    assert value_dm != pytest.approx(1.0, rel=1e-6)
+    assert value_dm == pytest.approx(value_direct, rel=1e-8)
+
+
+@requires_symmray
+@pytest.mark.parametrize("direction", ["xmin", "xmax", "ymin", "ymax"])
+def test_dm_layered_norm_matches_direct_abelian(direction):
+    """Check truncated DM compression of a layered norm with non-fermionic
+    block sparse arrays, whose density matrices are not formed explicitly.
+    """
+    import symmray as sr
+
+    psi = sr.PEPS_abelian_rand("Z2", 4, 4, bond_dim=2, phys_dim=2, seed=7)
+    norm = psi.make_norm()
+    contraction_options = {
+        "max_bond": 4,
+        "cutoff": 0.0,
+        "layer_tags": ("KET", "BRA"),
+        "sequence": (direction,),
+    }
+    value_dm = norm.contract_boundary(method="dm", **contraction_options)
+    value_direct = norm.contract_boundary(
+        method="direct", **contraction_options
+    )
+    assert value_dm == pytest.approx(value_direct, rel=1e-8)
+
+
+def test_dm_layered_norm_decomposition_size():
+    """Check DM never decomposes a matrix larger than the bound on its rank,
+    which for a layered norm is much smaller than the reduced density matrix.
+    """
+    from autoray.lazy import descend
+
+    D, chi = 2, 4
+    peps = qtn.PEPS.from_fill_fn(
+        lambda shape: ar.lazy.Variable(shape, backend="numpy"), 4, 4, D, 2
+    )
+    z = peps.make_norm().contract_boundary(
+        max_bond=chi,
+        cutoff=0.0,
+        method="dm",
+        layer_tags=("KET", "BRA"),
+        sequence=("ymin",),
+    )
+    sizes = [
+        min(node.deps[0].shape)
+        for node in descend(z)
+        if any(name in node.fn_name for name in ("eigh", "svd", "qr"))
+    ]
+    assert sizes
+    # rho itself would be chi * D**2 * phys_dim
+    assert max(sizes) <= chi * D
+
+
+@requires_symmray
+@pytest.mark.parametrize(
+    "site_charge",
+    [
+        pytest.param(lambda site: 0, id="even"),
+        pytest.param(lambda site: 1, id="odd"),
+        pytest.param(lambda site: (site[0] + site[1]) % 2, id="odd-checker"),
+    ],
+)
+@pytest.mark.parametrize("duals", bond_orientations)
+@pytest.mark.parametrize("layer_tags", [("KET", "BRA"), ("BRA", "KET")])
+@pytest.mark.parametrize("direction", ["xmin", "xmax", "ymin", "ymax"])
+def test_dm_layered_norm_matches_direct_fermionic(
+    site_charge, duals, layer_tags, direction
+):
+    """Check truncated DM compression of a layered fermionic norm, whose
+    density matrices are not formed explicitly. Odd parity sites, with the bra
+    layer first, need the QR charge and dummy modes kept off the projector.
+    """
+    import symmray as sr
+
+    psi = sr.PEPS_fermionic_rand(
+        "Z2",
+        4,
+        4,
+        bond_dim=2,
+        phys_dim=2,
+        site_charge=site_charge,
+        duals=duals,
+        seed=7,
+        dist="uniform",
+        loc=-0.5,
+    )
+    norm = psi.make_norm()
+    contraction_options = {
+        "max_bond": 4,
+        "cutoff": 0.0,
+        "layer_tags": layer_tags,
+        "sequence": (direction,),
+    }
+    value_dm = norm.contract_boundary(method="dm", **contraction_options)
+    value_direct = norm.contract_boundary(
+        method="direct", **contraction_options
+    )
+    assert value_dm == pytest.approx(value_direct, rel=1e-8)
+
+
+def make_fermionic_long_range_tn():
+    """An odd parity fermionic PEPS ordered as a 1D snake, so that the
+    vertical bonds (0, 0)-(1, 0) and (0, 1)-(1, 1) are long range.
+    """
+    import symmray as sr
+
+    psi = sr.PEPS_fermionic_rand(
+        "Z2", 2, 3, bond_dim=2, phys_dim=2, site_charge=lambda site: 1, seed=3
+    )
+    snake = [(0, 0), (0, 1), (0, 2), (1, 2), (1, 1), (1, 0)]
+    site_tags = [psi.site_tag(*site) for site in snake]
+    return psi, site_tags
+
+
+@requires_symmray
+@pytest.mark.parametrize(
+    "method",
+    [
+        "direct",
+        "dm",
+        "zipup",
+        "zipup-oversample",
+        "sdc",
+        "sdc-oversample",
+        "sdcr",
+        "sdcr-oversample",
+        "fit-zipup",
+    ],
+)
+@pytest.mark.parametrize("sweep_reverse", [False, True])
+def test_fermionic_long_range_exact(method, sweep_reverse):
+    """Check exact compression of a fermionic network with long range bonds,
+    which these methods handle without inserting identities, which symmray
+    arrays do not support.
+    """
+    psi, site_tags = make_fermionic_long_range_tn()
+    new = qtn.tensor_network_1d_compress(
+        psi,
+        max_bond=8,
+        method=method,
+        site_tags=site_tags,
+        sweep_reverse=sweep_reverse,
+    )
+    assert new.max_bond() <= 8
+    expected = (psi.conj() & psi).contract()
+    assert (new.conj() & psi).contract() == pytest.approx(expected, rel=1e-8)
+    assert (new.conj() & new).contract() == pytest.approx(expected, rel=1e-8)
+
+
+@requires_symmray
+@pytest.mark.parametrize("method", ["direct", "dm"])
+@pytest.mark.parametrize("sweep_reverse", [False, True])
+def test_truncating_fermionic_long_range(method, sweep_reverse):
+    """Check truncated compression of a fermionic network with long range
+    bonds against an exact zipup followed by a truncating SVD sweep.
+    """
+    psi, site_tags = make_fermionic_long_range_tn()
+    compress_opts = {
+        "max_bond": 2,
+        "site_tags": site_tags,
+        "sweep_reverse": sweep_reverse,
+    }
+    new = qtn.tensor_network_1d_compress(psi, method=method, **compress_opts)
+    new_ref = qtn.tensor_network_1d_compress(
+        psi,
+        method="zipup-oversample",
+        # exact zipup so only the final sweep truncates
+        max_bond_oversample=8,
+        **compress_opts,
+    )
+    overlap = (new.conj() & psi).contract()
+    overlap_ref = (new_ref.conj() & psi).contract()
+    assert overlap == pytest.approx(overlap_ref, rel=1e-8)
+    norm = (new.conj() & new).contract()
+    norm_ref = (new_ref.conj() & new_ref).contract()
+    assert norm == pytest.approx(norm_ref, rel=1e-8)
+
+
+@requires_symmray
+@pytest.mark.parametrize("method", ["srcmps", "srcmps-oversample", "fit"])
+@pytest.mark.parametrize("symmetry", ["abelian", "fermionic"])
+@pytest.mark.parametrize("sweep_reverse", [False, True])
+def test_long_range_with_guess(method, symmetry, sweep_reverse):
+    """Check that methods taking a guess handle long range bonds directly,
+    since symmray arrays cannot insert identities.
+    """
+    import symmray as sr
+
+    if symmetry == "abelian":
+        psi = sr.PEPS_abelian_rand("Z2", 2, 3, bond_dim=2, phys_dim=2, seed=3)
+        snake = [(0, 0), (0, 1), (0, 2), (1, 2), (1, 1), (1, 0)]
+        site_tags = [psi.site_tag(*site) for site in snake]
+    else:
+        psi, site_tags = make_fermionic_long_range_tn()
+
+    new = qtn.tensor_network_1d_compress(
+        psi,
+        max_bond=8,
+        method=method,
+        site_tags=site_tags,
+        tn_fit="zipup",
+        sweep_reverse=sweep_reverse,
+    )
+    assert new.num_tensors == 6
+    expected = (psi.conj() & psi).contract()
+    assert (new.conj() & psi).contract() == pytest.approx(expected, rel=1e-8)
+    assert (new.conj() & new).contract() == pytest.approx(expected, rel=1e-8)
+
+
+def test_tn_matching_edges():
+    psi = qtn.PEPS.rand(2, 3, bond_dim=2, seed=3)
+    snake = [(0, 0), (0, 1), (0, 2), (1, 2), (1, 1), (1, 0)]
+    site_tags = [psi.site_tag(*site) for site in snake]
+    guess = qtn.TN_matching(psi, max_bond=3, site_tags=site_tags, seed=4)
+    assert guess.num_indices == 7 + 6
+    chain = qtn.TN_matching(
+        psi,
+        max_bond=3,
+        site_tags=site_tags,
+        edges=zip(site_tags[:-1], site_tags[1:]),
+        seed=4,
+    )
+    assert chain.num_indices == 5 + 6
+    for tag_a, tag_b in zip(site_tags[:-1], site_tags[1:]):
+        assert len(chain[tag_a].bonds(chain[tag_b])) == 1
+    assert set(chain.outer_inds()) == set(psi.outer_inds())
+
+
+def test_srcmps_guess_sketch():
+    # a good guess should give a good sketch, also for complex arrays
+    mps = qtn.MPS_rand_state(12, 16, dtype="complex128", seed=1)
+    mpo = qtn.MPO_rand(12, 4, dtype="complex128", seed=2)
+    tn = mpo.apply(mps, compress=False)
+    guess = qtn.tensor_network_1d_compress(tn, max_bond=12, method="dm")
+    new = qtn.tensor_network_1d_compress(
+        tn, max_bond=12, method="srcmps", tn_fit=guess
+    )
+    assert new.distance_normalized(tn) < 1.05 * guess.distance_normalized(tn)
+
+
 @pytest.mark.parametrize("method", ["srcmps", "fit"])
 def test_tn_fit(method):
     psi = qtn.MPS_rand_state(4, 3, seed=7)
@@ -430,6 +746,35 @@ def test_tn_fit(method):
         **compress_opts,
     )
     np.testing.assert_allclose(a.to_dense(), b.to_dense())
+
+
+def test_fit_single_sweep_cutoff_only():
+    mps = qtn.MPS_rand_state(8, 7, seed=1)
+    mpo = qtn.MPO_rand_herm(8, 3, seed=2)
+    tn = mpo.apply(mps, compress=False)
+    out = qtn.tensor_network_1d_compress(
+        tn, method="fit", cutoff=1e-10, max_iterations=1, seed=3
+    )
+    assert out.max_bond() <= 21
+
+
+def test_fit_single_sweep_guess_full_bond():
+    # a single 1-site sweep can only improve on a guess at max_bond
+    mps = qtn.MPS_rand_state(10, 7, seed=1)
+    mpo = qtn.MPO_rand_herm(10, 5, seed=2)
+    tn = mpo.apply(mps, compress=False)
+    ref = qtn.tensor_network_1d_compress(tn, method="zipup", max_bond=12)
+    out = qtn.tensor_network_1d_compress(
+        tn,
+        method="fit",
+        bsz=1,
+        max_bond=12,
+        cutoff=0.0,
+        tn_fit="zipup",
+        max_iterations=1,
+    )
+    assert out.max_bond() == 12
+    assert out.distance_normalized(tn) <= ref.distance_normalized(tn) + 1e-6
 
 
 @pytest.mark.parametrize(
@@ -551,6 +896,7 @@ def test_basic_compress_double_mpo(
         "fit-zipup",
         "fit-projector",
         "fit-oversample",
+        "projector",
     ],
 )
 @pytest.mark.parametrize("dtype", dtypes)
